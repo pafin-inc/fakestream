@@ -1,0 +1,32 @@
+[package]
+name = "fakestream"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal, low-memory local Amazon Kinesis Data Streams emulator"
+license = "MIT"
+repository = "https://github.com/Cryptact/fakestream"
+readme = "README.md"
+keywords = ["kinesis", "aws", "emulator", "mock", "localstack"]
+categories = ["development-tools", "development-tools::testing"]
+
+[[bin]]
+name = "fakestream"
+path = "src/main.rs"
+
+[dependencies]
+tiny_http = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+md-5 = "0.10"
+bincode = "2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[dev-dependencies]
+proptest = "1.11.0"
