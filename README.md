@@ -9,7 +9,7 @@ PutRecord + polling-consumer workflows. Kinesis only — nothing else.
 - Drop-in for a LocalStack-based local stack (replaces LocalStack's Kinesis;
   DynamoDB and friends stay exactly where they are).
 
-See `RESEARCH.md` for the alternatives comparison and `DESIGN.md` for the design.
+See `docs/RESEARCH.md` for the alternatives comparison and `docs/DESIGN.md` for the design.
 
 ## Build & run
 

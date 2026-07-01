@@ -119,7 +119,7 @@ neither served nor replayed from the WAL. `--ttl-seconds 0` disables trimming (k
 (`PutRecords`, `DeleteStream`, `DescribeStreamSummary` aren't strictly used today but are cheap and
 commonly expected.)
 
-## Verified behavior (aws-cli + curl, 2026-06-05)
+## Verified behavior (aws-cli + curl)
 
 - `create-stream` (2 shards) → `describe-stream`/`list-shards` show correct contiguous 128-bit hash ranges.
 - `put-record` ×3 → `get-records` returns them in order; base64 payloads decode exactly.

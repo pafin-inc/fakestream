@@ -1,11 +1,11 @@
 # Kinesis local-emulator landscape — research memo
 
-_Date: 2026-06-05. Scope: replacing LocalStack's Kinesis for local development. Kinesis only — DynamoDB and everything else stays on whatever you run today._
+_Scope: replacing LocalStack's Kinesis for local development. Kinesis only — DynamoDB and everything else stays on whatever you run today._
 
 ## TL;DR
 
 - **LocalStack's Kinesis provider *is* kinesis-mock.** The default is kinesis-mock's Node.js engine; `KINESIS_MOCK_PROVIDER_ENGINE=scala` (often paired with a multi-GB heap) swaps in the Scala/JVM build for ~10× throughput. So "alternatives to LocalStack for Kinesis" really collapses to: **use kinesis-mock directly, use moto, or build our own.**
-- The free-tier pain that started this (LocalStack killed Community on 2026-03-23) is **not** a Kinesis-capability gap — kinesis-mock and moto both cover the operations we use. The real wins from building our own are **memory footprint** and **zero JVM/Python runtime**, not missing features.
+- The free-tier pain that started this (LocalStack killed its Community edition) is **not** a Kinesis-capability gap — kinesis-mock and moto both cover the operations we use. The real wins from building our own are **memory footprint** and **zero JVM/Python runtime**, not missing features.
 - The actual usage is tiny and polling-only. There's **no** enhanced fan-out, resharding, encryption, tags, or KCL. That makes a from-scratch Rust server genuinely small (it's already built — see `DESIGN.md`).
 
 ## Operations actually used
@@ -30,7 +30,7 @@ Error paths the code depends on: `ExpiredIteratorException` (poller restarts the
 
 ### 1. kinesis-mock (`etspaceman/kinesis-mock`)
 - **Language/runtime:** Scala on JVM; also ships a Node.js build (`npm i kinesis-local`) and a Docker image (`ghcr.io/etspaceman/kinesis-mock`).
-- **Activity:** Healthy — v0.6.2 (2026-05-29), 1,300+ commits.
+- **Activity:** Healthy — v0.6.2, 1,300+ commits.
 - **Coverage:** Broad and correct (it's what LocalStack embeds). Polling consumers only for KCL — no enhanced fan-out, same as us.
 - **Persistence:** `SHOULD_PERSIST_DATA`, `PERSIST_INTERVAL`, `PERSIST_PATH`.
 - **Cost for us:** JVM memory. LocalStack's Scala engine defaults to 256m initial / 512m max heap and is documented to need *more* under load (4 GB is common). The Node engine avoids the JVM but is the slower path and still carries a Node runtime. There's a known LocalStack OOM/CPU bug for the Kinesis mock ([localstack#9755](https://github.com/localstack/localstack/issues/9755)).
@@ -52,7 +52,7 @@ Error paths the code depends on: `ExpiredIteratorException` (poller restarts the
 
 For the goal (drop-in local Kinesis, minimal memory, Rust, no runtime):
 
-1. **Build it** — the surface is small and the footprint win is real. Status: **done, MVP works** (`DESIGN.md`, `README.md`). Idle RSS **~2 MB**, ~12 MB holding 20k×200 B records, 493 KB binary, instant start — vs a 512 MB–4 GB JVM heap.
+1. **Build it** — the surface is small and the footprint win is real. Status: **done, MVP works** (`DESIGN.md`, `../README.md`). Idle RSS **~2 MB**, ~12 MB holding 20k×200 B records, 493 KB binary, instant start — vs a 512 MB–4 GB JVM heap.
 2. **Fallback if we drop the build:** run **kinesis-mock directly** (Docker image or `kinesis-local`) and delete LocalStack — same engine, no LocalStack wrapper. Use **moto** for Python unit tests.
 
 Sources: [LocalStack Kinesis docs](https://docs.localstack.cloud/aws/services/kinesis/) · [LocalStack 4.5 release notes](https://blog.localstack.cloud/localstack-release-v-4-5-0/) · [localstack#9755 (Kinesis mock OOM)](https://github.com/localstack/localstack/issues/9755) · [kinesis-mock](https://github.com/etspaceman/kinesis-mock) · [moto Kinesis](https://docs.getmoto.org/en/latest/docs/services/kinesis.html)
