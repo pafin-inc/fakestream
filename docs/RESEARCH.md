@@ -5,7 +5,7 @@ _Scope: replacing LocalStack's Kinesis for local development. Kinesis only — D
 ## TL;DR
 
 - **LocalStack's Kinesis provider *is* kinesis-mock.** The default is kinesis-mock's Node.js engine; `KINESIS_MOCK_PROVIDER_ENGINE=scala` (often paired with a multi-GB heap) swaps in the Scala/JVM build for ~10× throughput. So "alternatives to LocalStack for Kinesis" really collapses to: **use kinesis-mock directly, use moto, or build our own.**
-- The free-tier pain that started this (LocalStack killed its Community edition) is **not** a Kinesis-capability gap — kinesis-mock and moto both cover the operations we use. The real wins from building our own are **memory footprint** and **zero JVM/Python runtime**, not missing features.
+- The free-tier pain that started this (LocalStack killed Community on 2026-03-23) is **not** a Kinesis-capability gap — kinesis-mock and moto both cover the operations we use. The real wins from building our own are **memory footprint** and **zero JVM/Python runtime**, not missing features.
 - The actual usage is tiny and polling-only. There's **no** enhanced fan-out, resharding, encryption, tags, or KCL. That makes a from-scratch Rust server genuinely small (it's already built — see `DESIGN.md`).
 
 ## Operations actually used
