@@ -3,9 +3,9 @@
 //! Everything lives behind a single `RwLock<Store>` in `main`. Records are kept
 //! as `Vec<u8>` payloads ordered by a global monotonic sequence number, which is
 //! all that polling consumers rely on. Stream and shard
-//! metadata is `Serialize`/`Deserialize` for the manifest; record payloads are
-//! excluded from that serde and persisted separately via the WAL (bincode, raw
-//! bytes — no base64 inflation).
+//! metadata is `Serialize`/`Deserialize` for the manifest JSON; record payloads
+//! are skipped there (`#[serde(skip)]` on `Shard::records`) and persisted
+//! separately via the WAL (postcard, raw bytes — no base64 inflation).
 
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,9 +14,9 @@ use serde::{Deserialize, Serialize};
 
 const ITERATOR_TTL_MS: u128 = 300_000; // AWS shard iterators expire after 5 minutes.
 
-/// A single record stored in a shard. Persisted to the WAL via bincode (raw
-/// bytes — no base64 inflation). Never serialized through serde.
-#[derive(bincode::Encode, bincode::Decode, Debug, Clone, PartialEq, Eq)]
+/// A single record stored in a shard. Persisted to the WAL via postcard (raw
+/// bytes — no base64 inflation); skipped in the manifest JSON.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Record {
     pub seq: u64,
     pub partition_key: String,

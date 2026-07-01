@@ -1,5 +1,5 @@
 //! Append-only, segmented write-ahead log for records. Each frame is
-//! `[u64 length LE][bincode((stream, shard_id, record))]`. The length prefix
+//! `[u64 length LE][postcard((stream, shard_id, record))]`. The length prefix
 //! makes a crash-truncated trailing frame detectable on replay. Segments are
 //! dropped whole once every record in them is past retention, so there is never
 //! a full-store serialization.
@@ -8,7 +8,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use bincode::config::{standard, Configuration};
+use serde::Serialize;
 
 use crate::store::Record;
 
@@ -17,28 +17,21 @@ const SUBDIR: &str = "wal";
 /// One decoded log entry: which stream/shard a record belongs to, plus the record.
 pub type Entry = (String, String, Record);
 
-fn cfg() -> Configuration {
-    standard()
-}
-
-/// Encode one framed entry: 8-byte LE length prefix + bincode body. Borrows the
+/// Encode one framed entry: 8-byte LE length prefix + postcard body. Borrows the
 /// record (no payload clone).
 pub fn encode_frame(stream: &str, shard_id: &str, record: &Record) -> Vec<u8> {
-    #[derive(bincode::Encode)]
+    #[derive(Serialize)]
     struct FrameRef<'a> {
         s: &'a str,
         sh: &'a str,
         r: &'a Record,
     }
-    let body = bincode::encode_to_vec(
-        FrameRef {
-            s: stream,
-            sh: shard_id,
-            r: record,
-        },
-        cfg(),
-    )
-    .expect("bincode encode of a record cannot fail");
+    let body = postcard::to_allocvec(&FrameRef {
+        s: stream,
+        sh: shard_id,
+        r: record,
+    })
+    .expect("postcard encode of a record cannot fail");
     let mut frame = Vec::with_capacity(8 + body.len());
     frame.extend_from_slice(&(body.len() as u64).to_le_bytes());
     frame.extend_from_slice(&body);
@@ -58,8 +51,8 @@ pub fn decode_segment(bytes: &[u8]) -> (Vec<Entry>, usize) {
             Some(end) if end <= bytes.len() => end,
             _ => break, // torn: length runs past EOF
         };
-        match bincode::decode_from_slice::<Entry, _>(&bytes[body_start..body_end], cfg()) {
-            Ok((entry, _)) => {
+        match postcard::from_bytes::<Entry>(&bytes[body_start..body_end]) {
+            Ok(entry) => {
                 out.push(entry);
                 off = body_end;
             }
