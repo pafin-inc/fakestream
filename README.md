@@ -94,8 +94,8 @@ Errors: `ResourceNotFoundException`, `ResourceInUseException`, `ExpiredIteratorE
 Pull the prebuilt multi-arch image (`linux/amd64`, `linux/arm64`) from GHCR:
 
 ```sh
-docker pull ghcr.io/cryptact/fakestream:latest
-docker run --rm -p 4567:4567 ghcr.io/cryptact/fakestream:latest
+docker pull ghcr.io/pafin-inc/fakestream:latest
+docker run --rm -p 4567:4567 ghcr.io/pafin-inc/fakestream:latest
 ```
 
 Or build it locally:
@@ -117,7 +117,7 @@ Narrow LocalStack to `SERVICES=dynamodb` and add a `fakestream` service:
 
 ```yaml
   fakestream:
-    image: ghcr.io/cryptact/fakestream    # or build: ./fakestream
+    image: ghcr.io/pafin-inc/fakestream    # or build: ./fakestream
     ports:
       - "4567:4567"
     environment:
