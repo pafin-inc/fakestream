@@ -145,6 +145,9 @@ pub fn put_records(
     req: &Value,
 ) -> Result<Value, ApiError> {
     let name = require_str(req, "StreamName")?;
+    if !store.streams.contains_key(name) {
+        return Err(ApiError::not_found(format!("Stream {name} not found")));
+    }
     let records = req
         .get("Records")
         .and_then(Value::as_array)
@@ -182,28 +185,22 @@ pub fn put_records(
     }
 
     let mut out = Vec::with_capacity(decoded.len());
-    let mut failed = 0u64;
     for (partition_key, data, explicit) in decoded {
-        match store.put(name, partition_key, data, explicit) {
-            Some((shard_id, seq)) => {
-                if let Some(wal) = wal.as_deref_mut() {
-                    if let Some(rec) = store.last_record(name, &shard_id) {
-                        if let Err(err) = wal.append(name, &shard_id, rec) {
-                            eprintln!("fakestream: WAL append failed: {err}");
-                        }
-                    }
+        // The stream exists (checked above) and shards span the full hash ring
+        // under a single write lock, so put always routes to a shard.
+        let Some((shard_id, seq)) = store.put(name, partition_key, data, explicit) else {
+            return Err(ApiError::not_found(format!("Stream {name} not found")));
+        };
+        if let Some(wal) = wal.as_deref_mut() {
+            if let Some(rec) = store.last_record(name, &shard_id) {
+                if let Err(err) = wal.append(name, &shard_id, rec) {
+                    eprintln!("fakestream: WAL append failed: {err}");
                 }
-                out.push(json!({ "ShardId": shard_id, "SequenceNumber": seq.to_string() }));
-            }
-            None => {
-                failed += 1;
-                out.push(
-                    json!({ "ErrorCode": "ResourceNotFound", "ErrorMessage": "Stream not found" }),
-                );
             }
         }
+        out.push(json!({ "ShardId": shard_id, "SequenceNumber": seq.to_string() }));
     }
-    Ok(json!({ "FailedRecordCount": failed, "Records": out }))
+    Ok(json!({ "FailedRecordCount": 0, "Records": out }))
 }
 
 // ---- read operations --------------------------------------------------------
@@ -498,14 +495,15 @@ mod tests {
     }
 
     #[test]
-    fn put_records_reports_failures_for_unknown_stream() {
+    fn put_records_rejects_unknown_stream() {
         let mut store = Store::new(86_400); // NO stream created
         let req = json!({ "StreamName": "MISSING", "Records": [
             { "PartitionKey": "p", "Data": encode_data(&[1, 2, 3]) }
         ]});
-        let out = put_records(&mut store, None, &req).unwrap();
-        assert_eq!(out["FailedRecordCount"], 1);
-        assert_eq!(out["Records"][0]["ErrorCode"], "ResourceNotFound");
+        assert_eq!(
+            put_records(&mut store, None, &req).unwrap_err().kind,
+            "ResourceNotFoundException"
+        );
     }
 
     #[test]
