@@ -45,12 +45,12 @@ main.rs        config (flags/env), HTTP loop, op routing, maintenance thread, re
 protocol.rs    X-Amz-Target parsing, ApiError → AWS JSON error body, base64 helpers
 store.rs       Store/Stream/Shard/Record, MD5 hash-key routing, sequence counter, iterators, trim
 manifest.rs    atomic JSON manifest save + load-on-startup (stream defs + seq high-water)
-wal.rs         segmented append-only WAL: length-framed bincode records, segment roll + drop
+wal.rs         segmented append-only WAL: length-framed postcard records, segment roll + drop
 ops.rs         one handler per operation; request parsing + JSON response shaping
 ```
 
 Dependencies (intentionally few): `tiny_http` (blocking HTTP, no tokio), `serde`/`serde_json`,
-`base64`, `md-5`. Release profile is size-optimized (`opt-level="z"`, LTO, `panic="abort"`, stripped).
+`postcard`, `base64`, `md-5`. Release profile is size-optimized (`opt-level="z"`, LTO, `panic="abort"`, stripped).
 
 ## Persistence & retention
 
@@ -65,8 +65,8 @@ Two files make up the persistent state:
   (write to `<dir>/manifest.json.tmp`, then rename) whenever a stream is created or deleted, and on
   each maintenance tick. Records are **not** stored here; a pure-manifest restart with no WAL
   recovers stream definitions only.
-- **`<dir>/wal/seg-NNNNNNNNNN.log`** — length-framed bincode records (8-byte LE length prefix +
-  bincode body) in an append-only segmented file. Each new `PutRecord`/`PutRecords` call appends
+- **`<dir>/wal/seg-NNNNNNNNNN.log`** — length-framed postcard records (8-byte LE length prefix +
+  postcard body) in an append-only segmented file. Each new `PutRecord`/`PutRecords` call appends
   frames to the active segment. When the active segment reaches `--segment-bytes` (default 64 MiB),
   a new segment is opened. On replay, a crash-torn trailing frame (length prefix present but body
   truncated) is detected and the file is truncated to the last good byte so future appends stay

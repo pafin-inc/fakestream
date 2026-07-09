@@ -42,7 +42,7 @@ in-memory (ideal for tests).
 The persistence layout inside `<dir>`:
 - `manifest.json` — stream definitions and the sequence counter high-water mark (atomically
   rewritten on stream create/delete and on each maintenance tick; records are **not** inlined).
-- `wal/seg-NNNNNNNNNN.log` — segmented append-only write-ahead log (length-framed bincode
+- `wal/seg-NNNNNNNNNN.log` — segmented append-only write-ahead log (length-framed postcard
   records). On startup, the manifest is loaded and then all WAL segments are replayed in order
   to recover records. A crash-torn trailing frame is detected and truncated so appends stay
   clean. Whole segments are dropped once every record in them is past retention.
