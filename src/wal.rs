@@ -77,6 +77,7 @@ pub struct Wal {
     active: BufWriter<File>,
     active_bytes: u64,
     active_max_ts: u128,
+    poisoned: bool, // a failed append may have torn the active segment; roll before the next
 }
 
 fn seg_name(id: u64) -> String {
@@ -111,12 +112,23 @@ impl Wal {
             let bytes = fs::read(&path)?;
             let (mut seg_entries, good_off) = decode_segment(&bytes);
             let is_last = idx + 1 == ids.len();
-            if is_last && good_off < bytes.len() {
-                // Crash-torn trailing frame: truncate so future appends stay clean.
-                OpenOptions::new()
-                    .write(true)
-                    .open(&path)?
-                    .set_len(good_off as u64)?;
+            if good_off < bytes.len() {
+                if is_last {
+                    // Crash-torn trailing frame: truncate so future appends stay clean.
+                    OpenOptions::new()
+                        .write(true)
+                        .open(&path)?
+                        .set_len(good_off as u64)?;
+                } else {
+                    // Corruption inside a closed segment: later frames in this
+                    // segment stay unreadable, but segments after it still
+                    // replay. Surface it rather than dropping bytes silently.
+                    eprintln!(
+                        "fakestream: WAL segment {} skipping {} byte(s) after a corrupt frame",
+                        path.display(),
+                        bytes.len() - good_off
+                    );
+                }
             }
             let max_ts = seg_entries
                 .iter()
@@ -145,22 +157,36 @@ impl Wal {
                 active: BufWriter::new(file),
                 active_bytes,
                 active_max_ts,
+                poisoned: false,
             },
             entries,
         ))
     }
 
-    /// Append one record frame; roll to a new segment first if the active one is full.
+    /// Append one record frame; roll to a new segment first if the active one is
+    /// full or was poisoned by a prior failed append.
     pub fn append(&mut self, stream: &str, shard_id: &str, record: &Record) -> io::Result<()> {
-        if self.active_bytes >= self.segment_max {
+        if self.poisoned || self.active_bytes >= self.segment_max {
             self.roll()?;
         }
         let frame = encode_frame(stream, shard_id, record);
-        self.active.write_all(&frame)?;
-        self.active.flush()?; // to OS buffer; survives process crash (no fsync by design)
+        if let Err(err) = self.write_frame(&frame) {
+            // A partial write may have left a torn frame at the tail. Poison the
+            // segment so the next append rolls to a fresh one: valid frames can
+            // then never sit behind this garbage (decode stops at the first bad
+            // frame, and last-segment truncate-repair would drop everything
+            // after it). The failed record itself is reported to the caller.
+            self.poisoned = true;
+            return Err(err);
+        }
         self.active_bytes += frame.len() as u64;
         self.active_max_ts = self.active_max_ts.max(record.timestamp_ms);
         Ok(())
+    }
+
+    fn write_frame(&mut self, frame: &[u8]) -> io::Result<()> {
+        self.active.write_all(frame)?;
+        self.active.flush() // to OS buffer; survives process crash (no fsync by design)
     }
 
     /// Delete closed segments whose newest record is older than retention. The
@@ -211,6 +237,7 @@ impl Wal {
         self.active = BufWriter::new(OpenOptions::new().create(true).append(true).open(path)?);
         self.active_bytes = 0;
         self.active_max_ts = 0;
+        self.poisoned = false;
         Ok(())
     }
 }
@@ -498,6 +525,63 @@ mod tests {
         fs::remove_dir(&bad).unwrap();
         assert_eq!(wal.drop_expired(1_000_000_000, 1).unwrap(), 1);
         assert!(wal.closed.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn poisoned_segment_rolls_before_next_append() {
+        let dir = tmp_dir("poison");
+        let (mut wal, _) = Wal::load(&dir, 1 << 20).unwrap(); // large cap: no natural roll
+        wal.append("S", "shardId-000000000000", &rec(1, vec![1]))
+            .unwrap();
+        let before = fs::read_dir(dir.join(SUBDIR)).unwrap().count();
+        // Stand in for a failed append having torn the active segment.
+        wal.poisoned = true;
+        wal.append("S", "shardId-000000000000", &rec(2, vec![2]))
+            .unwrap();
+        let after = fs::read_dir(dir.join(SUBDIR)).unwrap().count();
+        assert_eq!(
+            after,
+            before + 1,
+            "poisoned segment must roll to a fresh one"
+        );
+        drop(wal);
+        let (_w, entries) = Wal::load(&dir, 1 << 20).unwrap();
+        assert_eq!(
+            entries.iter().map(|(_, _, r)| r.seq).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupted_closed_segment_does_not_hide_later_segments() {
+        let dir = tmp_dir("corrupt-mid");
+        let (mut wal, _) = Wal::load(&dir, 16).unwrap(); // tiny cap: each record its own segment
+        for seq in 1..=3u64 {
+            wal.append("S", "shardId-000000000000", &rec(seq, vec![seq as u8; 20]))
+                .unwrap();
+        }
+        drop(wal);
+        let mut segs: Vec<PathBuf> = fs::read_dir(dir.join(SUBDIR))
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "log"))
+            .collect();
+        segs.sort();
+        // Corrupt a closed middle segment; the active (last) segment is segs[2].
+        fs::write(&segs[1], b"garbage-not-a-valid-frame").unwrap();
+        let (_w, entries) = Wal::load(&dir, 16).unwrap();
+        let seqs: Vec<u64> = entries.iter().map(|(_, _, r)| r.seq).collect();
+        assert!(seqs.contains(&1));
+        assert!(
+            seqs.contains(&3),
+            "a later segment must still replay past a corrupt one"
+        );
+        assert!(
+            !seqs.contains(&2),
+            "the corrupt segment's record is dropped"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }
