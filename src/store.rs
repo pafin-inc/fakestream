@@ -185,6 +185,20 @@ impl Store {
         Some((shard_id, seq))
     }
 
+    /// Undo the most recent `put` on a shard when its WAL append fails, so a
+    /// record we couldn't durably write is never acked to the client. Only pops
+    /// when the tail record still carries `seq` (the one we just assigned). The
+    /// seq counter is deliberately left advanced: burning the number keeps the
+    /// high-water monotonic so a later record can't reuse it.
+    pub fn pop_record(&mut self, stream: &str, shard_id: &str, seq: u64) -> Option<Record> {
+        let stream = self.streams.get_mut(stream)?;
+        let shard = stream.shards.iter_mut().find(|s| s.id == shard_id)?;
+        if shard.records.last().map(|r| r.seq) != Some(seq) {
+            return None;
+        }
+        shard.records.pop()
+    }
+
     /// (stream name, record count, total payload bytes) for every stream.
     /// Used by the metrics endpoint to expose per-stream gauges without
     /// exposing internal fields.
@@ -335,6 +349,22 @@ mod tests {
         s.bump_seq_to(42);
         let (_, seq) = s.put("S", "p".into(), vec![9], None).unwrap();
         assert_eq!(seq, 43);
+    }
+
+    #[test]
+    fn pop_record_removes_only_the_matching_tail() {
+        let mut s = Store::new(86_400);
+        s.create_stream("S", 1, None);
+        let (shard_id, seq) = s.put("S", "p".into(), vec![1], None).unwrap();
+        // A stale seq must not pop the tail.
+        assert!(s.pop_record("S", &shard_id, seq + 1).is_none());
+        assert!(s.last_record("S", &shard_id).is_some());
+        // The matching seq pops it.
+        assert_eq!(s.pop_record("S", &shard_id, seq).unwrap().seq, seq);
+        assert!(s.last_record("S", &shard_id).is_none());
+        // The seq counter stays advanced: the next put gets a fresh number.
+        let (_, next) = s.put("S", "p".into(), vec![2], None).unwrap();
+        assert_eq!(next, seq + 1);
     }
 
     #[test]

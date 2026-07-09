@@ -191,10 +191,16 @@ pub fn put_record(
         .put(name, partition_key, data, explicit)
         .ok_or_else(|| ApiError::not_found(format!("Stream {name} not found")))?;
     if let Some(wal) = wal {
-        if let Some(rec) = store.last_record(name, &shard_id) {
-            if let Err(err) = wal.append(name, &shard_id, rec) {
-                eprintln!("fakestream: WAL append failed: {err}");
-            }
+        let appended = store
+            .last_record(name, &shard_id)
+            .map(|rec| wal.append(name, &shard_id, rec));
+        if let Some(Err(err)) = appended {
+            // The record wasn't durably written; roll it back so we don't ack a
+            // seq that vanishes on restart (which would let the seq high-water
+            // regress and re-issue that number for a different record).
+            eprintln!("fakestream: WAL append failed: {err}");
+            store.pop_record(name, &shard_id, seq);
+            return Err(ApiError::internal("Record could not be durably persisted"));
         }
     }
     Ok(json!({ "ShardId": shard_id, "SequenceNumber": seq.to_string() }))
@@ -246,6 +252,7 @@ pub fn put_records(
     }
 
     let mut out = Vec::with_capacity(decoded.len());
+    let mut failed = 0u64;
     for (partition_key, data, explicit) in decoded {
         // The stream exists (checked above) and shards span the full hash ring
         // under a single write lock, so put always routes to a shard.
@@ -253,15 +260,25 @@ pub fn put_records(
             return Err(ApiError::not_found(format!("Stream {name} not found")));
         };
         if let Some(wal) = wal.as_deref_mut() {
-            if let Some(rec) = store.last_record(name, &shard_id) {
-                if let Err(err) = wal.append(name, &shard_id, rec) {
-                    eprintln!("fakestream: WAL append failed: {err}");
-                }
+            let appended = store
+                .last_record(name, &shard_id)
+                .map(|rec| wal.append(name, &shard_id, rec));
+            if let Some(Err(err)) = appended {
+                // Per-record failure: roll the record back and report it so the
+                // client can retry, mirroring real Kinesis partial-failure batches.
+                eprintln!("fakestream: WAL append failed: {err}");
+                store.pop_record(name, &shard_id, seq);
+                failed += 1;
+                out.push(json!({
+                    "ErrorCode": "InternalFailure",
+                    "ErrorMessage": "Record could not be durably persisted",
+                }));
+                continue;
             }
         }
         out.push(json!({ "ShardId": shard_id, "SequenceNumber": seq.to_string() }));
     }
-    Ok(json!({ "FailedRecordCount": 0, "Records": out }))
+    Ok(json!({ "FailedRecordCount": failed, "Records": out }))
 }
 
 // ---- read operations --------------------------------------------------------
@@ -602,6 +619,28 @@ mod tests {
         let (_w, entries) = Wal::load(&dir, 1 << 20).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, "S"); // stream name recorded
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn put_records_reports_internal_failure_when_append_fails() {
+        use crate::wal::Wal;
+        let dir = std::env::temp_dir().join(format!("fs-ops-walfail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = store_with_stream();
+        // segment_max 0 makes every append roll first; removing the wal dir then
+        // makes the roll's create-open fail, forcing a WAL append error.
+        let (mut wal, _) = Wal::load(&dir, 0).unwrap();
+        std::fs::remove_dir_all(dir.join("wal")).unwrap();
+        let req = records_req(vec![(1, 4)]);
+        let out = put_records(&mut store, Some(&mut wal), &req).unwrap();
+        assert_eq!(out["FailedRecordCount"], 1);
+        assert_eq!(out["Records"][0]["ErrorCode"], "InternalFailure");
+        // Rolled back: the un-persisted record is not left in the store.
+        assert_eq!(
+            store.stream_sizes().iter().map(|(_, n, _)| n).sum::<u64>(),
+            0
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

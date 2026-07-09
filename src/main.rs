@@ -426,7 +426,7 @@ fn respond_error(request: Request, err: &ApiError) {
     let error_type = Header::from_bytes(&b"x-amzn-errortype"[..], err.kind.as_bytes())
         .expect("error kind is valid header value");
     let response = Response::from_string(err.body())
-        .with_status_code(400)
+        .with_status_code(err.status)
         .with_header(json_header())
         .with_header(error_type);
     let _ = request.respond(response);

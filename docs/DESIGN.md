@@ -28,7 +28,8 @@ Kinesis is a single endpoint: `POST /` with
 - `Content-Type: application/x-amz-json-1.1`
 - JSON body; record payloads (`Data`) are **base64** in JSON.
 
-Success → HTTP 200 + JSON. Error → HTTP 400 + `{"__type":"<Exception>","message":"…"}` and an
+Success → HTTP 200 + JSON. Error → HTTP 400 (500 for `InternalFailure`) +
+`{"__type":"<Exception>","message":"…"}` and an
 `x-amzn-errortype` header. Both `boto3` and `aws-sdk-js v3` read `__type` to build the typed error
 (this is why `ExpiredIteratorException` correctly triggers the consumer's iterator-restart path).
 
