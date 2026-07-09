@@ -173,16 +173,31 @@ impl Wal {
         let cutoff = retention_secs as u128 * 1000;
         let mut dropped = 0;
         let mut keep = Vec::with_capacity(self.closed.len());
+        let mut first_err: Option<io::Error> = None;
         for seg in std::mem::take(&mut self.closed) {
-            if now_ms.saturating_sub(seg.max_ts) > cutoff {
-                fs::remove_file(&seg.path)?;
-                dropped += 1;
-            } else {
+            if now_ms.saturating_sub(seg.max_ts) <= cutoff {
                 keep.push(seg);
+                continue;
+            }
+            match fs::remove_file(&seg.path) {
+                Ok(()) => dropped += 1,
+                // The file is already gone: the entry is stale, so let it go
+                // instead of retrying the removal every maintenance cycle.
+                Err(err) if err.kind() == io::ErrorKind::NotFound => dropped += 1,
+                // A real removal failure: keep the segment tracked so it stays a
+                // drop candidate next cycle rather than leaking on disk. Record
+                // the first error but keep processing the remaining segments.
+                Err(err) => {
+                    first_err.get_or_insert(err);
+                    keep.push(seg);
+                }
             }
         }
         self.closed = keep;
-        Ok(dropped)
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(dropped),
+        }
     }
 
     fn roll(&mut self) -> io::Result<()> {
@@ -434,6 +449,55 @@ mod tests {
         let dropped = wal.drop_expired(10_000_000, 1).unwrap();
         assert_eq!(dropped, 1);
         // active segment is never dropped even if it looks old
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn drop_expired_keeps_bookkeeping_when_removal_fails() {
+        let dir = tmp_dir("drop-err");
+        let (mut wal, _) = Wal::load(&dir, 1 << 20).unwrap();
+        let wal_dir = dir.join(SUBDIR);
+        let ok1 = wal_dir.join("seg-ok1.log");
+        let bad = wal_dir.join("seg-bad.log");
+        let ok2 = wal_dir.join("seg-ok2.log");
+        let gone = wal_dir.join("seg-gone.log");
+        fs::write(&ok1, b"x").unwrap();
+        fs::create_dir(&bad).unwrap(); // remove_file on a dir errors (not NotFound)
+        fs::write(&ok2, b"x").unwrap();
+        // `gone` is never created, so its removal hits NotFound.
+        wal.closed = vec![
+            Segment {
+                path: ok1.clone(),
+                max_ts: 1,
+            },
+            Segment {
+                path: bad.clone(),
+                max_ts: 1,
+            },
+            Segment {
+                path: ok2.clone(),
+                max_ts: 1,
+            },
+            Segment {
+                path: gone.clone(),
+                max_ts: 1,
+            },
+        ];
+
+        // now far in the future, retention 1s: every segment is expired.
+        let err = wal.drop_expired(1_000_000_000, 1).unwrap_err();
+        assert_ne!(err.kind(), io::ErrorKind::NotFound);
+        // Removable files are gone; the failed segment stays tracked; the
+        // already-missing segment is dropped rather than wedging the list.
+        assert!(!ok1.exists());
+        assert!(!ok2.exists());
+        assert_eq!(wal.closed.len(), 1);
+        assert_eq!(wal.closed[0].path, bad);
+
+        // Clear the failure, then the survivor drops cleanly on the next call.
+        fs::remove_dir(&bad).unwrap();
+        assert_eq!(wal.drop_expired(1_000_000_000, 1).unwrap(), 1);
+        assert!(wal.closed.is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 }
