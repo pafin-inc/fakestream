@@ -176,25 +176,36 @@ fn spawn_maintenance(
             .expect("store lock poisoned")
             .trim_expired(now);
         if let (Some(wal), Some(dir)) = (&wal, &persist_dir) {
-            // Persist the manifest (carrying the current seq high-water) BEFORE
-            // dropping segments so a crash can't lose it. Lock discipline is
-            // store-then-wal: release the store read lock before taking the wal.
-            let retentions = {
-                let store = store.read().expect("store lock poisoned");
-                if let Err(err) = manifest::save(std::path::Path::new(dir), &store) {
-                    eprintln!("fakestream: manifest save failed: {err}");
-                }
-                store.stream_retentions()
-            };
-            if let Err(err) = wal
-                .lock()
-                .expect("wal lock poisoned")
-                .drop_expired(now, &retentions)
-            {
-                eprintln!("fakestream: segment drop failed: {err}");
-            }
+            persist_and_gc(&store, wal, std::path::Path::new(dir), now);
         }
     });
+}
+
+/// One persistence pass: refresh the manifest, then drop fully-expired WAL
+/// segments. The manifest (carrying the current seq high-water) is saved BEFORE
+/// dropping segments so a crash can't lose it — and if the save fails, the GC
+/// is skipped entirely: the on-disk manifest may still list a stream that was
+/// deleted in memory, and dropping its segments would let a crash recover the
+/// stream's definition with its records gone. Lock discipline is store-then-wal:
+/// the store read lock is released before the wal lock is taken.
+fn persist_and_gc(store: &RwLock<Store>, wal: &Mutex<Wal>, dir: &std::path::Path, now: u128) {
+    let retentions = {
+        let store = store.read().expect("store lock poisoned");
+        match manifest::save(dir, &store) {
+            Ok(()) => store.stream_retentions(),
+            Err(err) => {
+                eprintln!("fakestream: manifest save failed: {err}");
+                return;
+            }
+        }
+    };
+    if let Err(err) = wal
+        .lock()
+        .expect("wal lock poisoned")
+        .drop_expired(now, &retentions)
+    {
+        eprintln!("fakestream: segment drop failed: {err}");
+    }
 }
 
 /// Read a value from an env var, falling back to a CLI flag.
@@ -433,7 +444,57 @@ fn respond_error(request: Request, err: &ApiError) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::Record;
     use serde_json::json;
+    use std::fs;
+
+    #[test]
+    fn failed_manifest_save_skips_wal_gc() {
+        let dir =
+            std::env::temp_dir().join(format!("fakestream-test-gc-skip-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // The store's only stream has been deleted, but the WAL still holds the
+        // deleted incarnation's records in a closed segment. If a crash restores
+        // a stale manifest that lists the stream, those records must still exist.
+        let store = RwLock::new(Store::new(86_400));
+        {
+            let mut s = store.write().unwrap();
+            s.create_stream("S", 1, None);
+            s.streams.remove("S");
+        }
+        let (mut wal, _) = Wal::load(&dir, 16).unwrap(); // tiny cap: each append rolls
+        let record = |seq: u64| Record {
+            seq,
+            partition_key: "p".into(),
+            data: vec![0u8; 20],
+            timestamp_ms: 1_000,
+        };
+        wal.append("S", "shardId-000000000000", &record(1)).unwrap();
+        wal.append("S", "shardId-000000000000", &record(2)).unwrap(); // rolls: seg 1 closes
+        let wal = Mutex::new(wal);
+        let wal_files = || fs::read_dir(dir.join("wal")).unwrap().count();
+        assert_eq!(wal_files(), 2, "one closed + one active segment");
+
+        // Block the manifest save: its temp-file path is occupied by a directory.
+        fs::create_dir(dir.join("manifest.json.tmp")).unwrap();
+        persist_and_gc(&store, &wal, &dir, 10_000_000);
+        assert!(!dir.join("manifest.json").exists());
+        assert_eq!(
+            wal_files(),
+            2,
+            "GC must not run when the manifest save fails"
+        );
+
+        // Unblocked, the next pass saves the manifest and only then drops the
+        // deleted stream's closed segment.
+        fs::remove_dir(dir.join("manifest.json.tmp")).unwrap();
+        persist_and_gc(&store, &wal, &dir, 10_000_000);
+        assert!(dir.join("manifest.json").exists());
+        assert_eq!(wal_files(), 1, "only the active segment remains");
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn successful_put_metrics_excludes_failed_entries() {
