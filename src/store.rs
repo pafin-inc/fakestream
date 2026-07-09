@@ -32,7 +32,6 @@ pub struct Shard {
     pub hash_end: u128,
     #[serde(skip)]
     pub records: Vec<Record>,
-    pub closed: bool,
 }
 
 /// A stream and its shards.
@@ -121,7 +120,6 @@ impl Store {
                 hash_start,
                 hash_end,
                 records: Vec::new(),
-                closed: false,
             });
         }
         let arn = format!("arn:aws:kinesis:us-east-1:000000000000:stream/{name}");
@@ -174,7 +172,7 @@ impl Store {
         let shard = stream
             .shards
             .iter_mut()
-            .find(|s| !s.closed && hash >= s.hash_start && hash <= s.hash_end)?;
+            .find(|s| hash >= s.hash_start && hash <= s.hash_end)?;
         let shard_id = shard.id.clone();
         shard.records.push(Record {
             seq,

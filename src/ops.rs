@@ -324,7 +324,7 @@ pub fn describe_stream(store: &Store, req: &Value) -> Result<Value, ApiError> {
 
 pub fn describe_stream_summary(store: &Store, req: &Value) -> Result<Value, ApiError> {
     let stream = lookup(store, resolve_stream_name(req)?)?;
-    let open = stream.shards.iter().filter(|s| !s.closed).count();
+    let open = stream.shards.len();
     Ok(json!({
         "StreamDescriptionSummary": {
             "StreamName": stream.name,
