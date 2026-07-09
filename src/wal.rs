@@ -389,17 +389,25 @@ mod tests {
         {
             let mut store = Store::new(86_400);
             store.create_stream("S", 1, None);
+            // The first incarnation assigned seqs 1..=3; advance the global
+            // counter the way real puts would.
+            store.bump_seq_to(3);
             let (mut wal, _) = Wal::load(&dir, 1 << 20).unwrap();
             for seq in 1..=3u64 {
                 let old = Record {
                     seq,
                     partition_key: "old".into(),
                     data: vec![seq as u8],
-                    timestamp_ms: 100,
+                    timestamp_ms: 1_000,
                 };
                 wal.append("S", shard, &old).unwrap();
             }
             store.streams.remove("S");
+            // Recreate under the same name: the seq floor is now 3. Delete +
+            // recreate landed in the same millisecond as the old incarnation's
+            // records — created_ms equals their timestamps, so wall time cannot
+            // separate the incarnations; only the seq floor (persisted in the
+            // manifest) can.
             store.create_stream("S", 1, None);
             store.streams.get_mut("S").unwrap().created_ms = 1_000;
             // seq 4 lands in the same millisecond as creation and must be kept;

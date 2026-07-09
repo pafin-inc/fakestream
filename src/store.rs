@@ -42,6 +42,12 @@ pub struct Stream {
     pub shards: Vec<Shard>,
     pub retention_secs: u64,
     pub created_ms: u128,
+    /// Global seq counter value when this stream was created. WAL records with
+    /// a seq at or below it belong to an earlier incarnation of the name and
+    /// must not replay into this one. Defaults to 0 (replay everything) so
+    /// manifests written before this field existed keep their old behavior.
+    #[serde(default)]
+    pub created_seq_floor: u64,
 }
 
 /// Top-level state: all streams, the global sequence counter, and the default
@@ -131,6 +137,7 @@ impl Store {
                 shards,
                 retention_secs,
                 created_ms: now_ms(),
+                created_seq_floor: self.seq_counter,
             },
         );
         true
@@ -248,12 +255,13 @@ impl Store {
         let Some(stream) = self.streams.get_mut(stream) else {
             return false;
         };
-        // Drop records written before this stream was created. Shard IDs are
-        // deterministic, so a delete-then-recreate of the same name reuses them;
-        // without this check a deleted stream's WAL records would resurrect in
-        // the recreated stream on replay. A record written in the same
-        // millisecond as creation still belongs to it, so the compare is strict.
-        if record.timestamp_ms < stream.created_ms {
+        // Drop records from an earlier incarnation of this stream name. Shard
+        // IDs are deterministic, so a delete-then-recreate reuses them and the
+        // deleted stream's WAL records would otherwise resurrect on replay.
+        // Wall time can't tell incarnations apart (delete + recreate can land
+        // in one millisecond); the global seq counter can — every seq assigned
+        // before this stream existed is at or below its creation-time floor.
+        if record.seq <= stream.created_seq_floor {
             return false;
         }
         let Some(shard) = stream.shards.iter_mut().find(|s| s.id == shard_id) else {
@@ -335,14 +343,59 @@ mod tests {
     fn restore_record_preserves_seq_and_does_not_increment_counter() {
         let mut s = Store::new(86_400);
         s.create_stream("S", 1, None);
-        // rec()'s timestamp predates a real creation clock; float creation back
-        // so replay accepts it (the resurrection guard uses created_ms).
-        s.streams.get_mut("S").unwrap().created_ms = 0;
         assert!(s.restore_record("S", "shardId-000000000000", rec(42)));
         assert_eq!(s.last_record("S", "shardId-000000000000").unwrap().seq, 42);
         s.bump_seq_to(42);
         let (_, seq) = s.put("S", "p".into(), vec![9], None).unwrap();
         assert_eq!(seq, 43);
+    }
+
+    #[test]
+    fn restore_record_rejects_earlier_incarnation_in_same_millisecond() {
+        let shard = "shardId-000000000000";
+        let mut s = Store::new(86_400);
+        s.create_stream("S", 1, None);
+        // First incarnation assigns seqs 1..=3 through the global counter.
+        for _ in 0..3 {
+            s.put("S", "p".into(), vec![1], None).unwrap();
+        }
+        s.streams.remove("S");
+        s.create_stream("S", 1, None); // floor = 3
+        let created_ms = s.streams["S"].created_ms;
+        // The old incarnation's last record carries the exact created_ms of the
+        // recreated stream — wall time cannot tell the incarnations apart.
+        let old = Record {
+            seq: 3,
+            partition_key: "old".into(),
+            data: vec![1],
+            timestamp_ms: created_ms,
+        };
+        assert!(!s.restore_record("S", shard, old));
+        // The new incarnation's first record, in that same millisecond, replays.
+        let new = Record {
+            seq: 4,
+            partition_key: "new".into(),
+            data: vec![1],
+            timestamp_ms: created_ms,
+        };
+        assert!(s.restore_record("S", shard, new));
+        assert_eq!(s.last_record("S", shard).unwrap().partition_key, "new");
+    }
+
+    #[test]
+    fn manifest_without_seq_floor_replays_everything() {
+        // Manifests written before created_seq_floor existed must still load,
+        // with the floor defaulting to 0 (their old replay-everything behavior).
+        let mut s = Store::new(86_400);
+        s.create_stream("S", 1, None);
+        // Strip the field textually: Value round-trips can't carry the u128
+        // shard hash bounds, so this edits the serialized form directly.
+        let json = serde_json::to_string(&s).unwrap();
+        let stripped = json.replace(",\"created_seq_floor\":0", "");
+        assert_ne!(json, stripped, "field should have been present and removed");
+        let mut back: Store = serde_json::from_str(&stripped).unwrap();
+        assert_eq!(back.streams["S"].created_seq_floor, 0);
+        assert!(back.restore_record("S", "shardId-000000000000", rec(1)));
     }
 
     #[test]
