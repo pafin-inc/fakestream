@@ -101,7 +101,7 @@ impl Config {
             .or_else(|| {
                 opt("--retention-hours", "FAKESTREAM_RETENTION_HOURS")
                     .and_then(|v| v.parse::<u64>().ok())
-                    .map(|hours| hours * 3600)
+                    .and_then(|hours| hours.checked_mul(3600))
             })
             .unwrap_or(DEFAULT_RETENTION_SECS);
         let persist_dir = opt("--persist", "FAKESTREAM_PERSIST_PATH").filter(|v| !v.is_empty());

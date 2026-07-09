@@ -16,6 +16,7 @@ const MAX_GET_RECORDS_BYTES: usize = 10 * 1_048_576; // 10 MiB, Kinesis GetRecor
 const RECORD_JSON_OVERHEAD: usize = 144; // fixed keys + quotes + seq/timestamp digits + comma
 const MAX_RECORD_BYTES: usize = 1_048_576; // 1 MiB, Kinesis data-blob limit (decoded)
 const MAX_PUT_RECORDS_COUNT: usize = 500;
+const MAX_SHARD_COUNT: u64 = 10_000; // Kinesis per-request CreateStream shard cap
 const MAX_PUT_RECORDS_AGGREGATE_BYTES: usize = 5 * 1_048_576; // 5 MiB, data + partition keys
 
 fn require_str<'a>(req: &'a Value, key: &str) -> Result<&'a str, ApiError> {
@@ -133,11 +134,24 @@ fn validate_stream_name(name: &str) -> Result<(), ApiError> {
 pub fn create_stream(store: &mut Store, req: &Value) -> Result<Value, ApiError> {
     let name = require_str(req, "StreamName")?;
     validate_stream_name(name)?;
-    let shard_count = req.get("ShardCount").and_then(Value::as_u64).unwrap_or(1) as u32;
-    let retention_secs = req
-        .get("RetentionPeriodHours")
-        .and_then(Value::as_u64)
-        .map(|h| h * 3600);
+    let shard_count = match req.get("ShardCount") {
+        None => 1u32,
+        Some(value) => value
+            .as_u64()
+            .filter(|count| (1..=MAX_SHARD_COUNT).contains(count))
+            .ok_or_else(|| {
+                ApiError::validation(
+                    "1 validation error detected: Value at 'shardCount' failed to satisfy \
+                     constraint: Member must have value between 1 and 10000",
+                )
+            })? as u32,
+    };
+    let retention_secs = match req.get("RetentionPeriodHours").and_then(Value::as_u64) {
+        Some(hours) => Some(hours.checked_mul(3600).ok_or_else(|| {
+            ApiError::validation("RetentionPeriodHours is too large to represent")
+        })?),
+        None => None,
+    };
     if !store.create_stream(name, shard_count, retention_secs) {
         return Err(ApiError::new(
             "ResourceInUseException",
@@ -369,11 +383,18 @@ pub fn get_records(store: &Store, req: &Value) -> Result<(Vec<u8>, u64, u64), Ap
             "Iterator expired (5 min TTL)",
         ));
     }
-    let limit = req
-        .get("Limit")
-        .and_then(Value::as_u64)
-        .unwrap_or(MAX_GET_RECORDS)
-        .min(MAX_GET_RECORDS) as usize;
+    let limit = match req.get("Limit") {
+        None => MAX_GET_RECORDS as usize,
+        Some(value) => value
+            .as_u64()
+            .filter(|limit| (1..=MAX_GET_RECORDS).contains(limit))
+            .ok_or_else(|| {
+                ApiError::validation(
+                    "1 validation error detected: Value at 'limit' failed to satisfy \
+                     constraint: Member must have value between 1 and 10000",
+                )
+            })? as usize,
+    };
     let stream = lookup(store, &it.stream)?;
     let shard = stream
         .shards
@@ -632,6 +653,44 @@ mod tests {
         assert_eq!(create("").unwrap_err().kind, "ValidationException");
     }
 
+    fn create_full(req: Value) -> Result<Value, ApiError> {
+        create_stream(&mut Store::new(86_400), &req)
+    }
+
+    #[test]
+    fn create_stream_accepts_shard_count_boundaries() {
+        assert!(create_full(json!({ "StreamName": "S", "ShardCount": 1 })).is_ok());
+        assert!(create_full(json!({ "StreamName": "S", "ShardCount": 10_000 })).is_ok());
+    }
+
+    #[test]
+    fn create_stream_rejects_bad_shard_count() {
+        for value in [json!(0), json!(10_001), json!(1.5)] {
+            assert_eq!(
+                create_full(json!({ "StreamName": "S", "ShardCount": value }))
+                    .unwrap_err()
+                    .kind,
+                "ValidationException"
+            );
+        }
+    }
+
+    #[test]
+    fn create_stream_accepts_short_retention() {
+        let out = create_full(json!({ "StreamName": "S", "RetentionPeriodHours": 1 }));
+        assert!(out.is_ok());
+    }
+
+    #[test]
+    fn create_stream_rejects_overflowing_retention() {
+        assert_eq!(
+            create_full(json!({ "StreamName": "S", "RetentionPeriodHours": u64::MAX }))
+                .unwrap_err()
+                .kind,
+            "ValidationException"
+        );
+    }
+
     // ---- GetShardIterator argument classification ------------------------------
 
     fn iterator_req(shard_id: &str, iterator_type: &str) -> Value {
@@ -721,6 +780,29 @@ mod tests {
         let (v, count, _) = get(&store, &token, Some(2));
         assert_eq!(count, 2);
         assert_eq!(v["Records"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn get_records_accepts_limit_boundaries() {
+        let store = store_with_stream();
+        let token = iterator_token(&store, "TRIM_HORIZON");
+        for limit in [1u64, MAX_GET_RECORDS] {
+            let req = json!({ "ShardIterator": token, "Limit": limit });
+            assert!(get_records(&store, &req).is_ok());
+        }
+    }
+
+    #[test]
+    fn get_records_rejects_out_of_range_limit() {
+        let store = store_with_stream();
+        let token = iterator_token(&store, "TRIM_HORIZON");
+        for limit in [json!(0), json!(MAX_GET_RECORDS + 1)] {
+            let req = json!({ "ShardIterator": token, "Limit": limit });
+            assert_eq!(
+                get_records(&store, &req).unwrap_err().kind,
+                "ValidationException"
+            );
+        }
     }
 
     #[test]
