@@ -285,16 +285,13 @@ impl Store {
             .last()
     }
 
-    /// Largest retention across all current streams (0 = keep-forever wins).
-    pub fn max_retention_secs(&self) -> u64 {
-        if self.streams.values().any(|s| s.retention_secs == 0) {
-            return 0;
-        }
+    /// Per-stream retention (seconds) for every current stream, used by the WAL
+    /// GC to decide segment drops per stream rather than by a single global value.
+    pub fn stream_retentions(&self) -> HashMap<String, u64> {
         self.streams
-            .values()
-            .map(|s| s.retention_secs)
-            .max()
-            .unwrap_or(self.default_retention_secs)
+            .iter()
+            .map(|(name, stream)| (name.clone(), stream.retention_secs))
+            .collect()
     }
 }
 
@@ -380,10 +377,13 @@ mod tests {
     }
 
     #[test]
-    fn max_retention_is_the_largest_stream() {
+    fn stream_retentions_reports_each_stream() {
         let mut s = Store::new(3600);
         s.create_stream("A", 1, Some(3600));
-        s.create_stream("B", 1, Some(86_400));
-        assert_eq!(s.max_retention_secs(), 86_400);
+        s.create_stream("B", 1, Some(0));
+        let retentions = s.stream_retentions();
+        assert_eq!(retentions.get("A"), Some(&3600));
+        assert_eq!(retentions.get("B"), Some(&0));
+        assert_eq!(retentions.len(), 2);
     }
 }

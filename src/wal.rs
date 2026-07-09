@@ -4,6 +4,7 @@
 //! dropped whole once every record in them is past retention, so there is never
 //! a full-store serialization.
 
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -63,9 +64,12 @@ pub fn decode_segment(bytes: &[u8]) -> (Vec<Entry>, usize) {
 }
 
 /// Bookkeeping for one closed segment, used to decide when it can be dropped.
+/// `max_ts` is per-stream: a segment can only be dropped once every stream it
+/// holds records for agrees, so one keep-forever stream can't pin segments that
+/// otherwise hold only another stream's long-expired records.
 struct Segment {
     path: PathBuf,
-    max_ts: u128,
+    max_ts: HashMap<String, u128>,
 }
 
 /// Append-only segmented log writer.
@@ -76,7 +80,7 @@ pub struct Wal {
     active_id: u64,
     active: BufWriter<File>,
     active_bytes: u64,
-    active_max_ts: u128,
+    active_max_ts: HashMap<String, u128>,
     poisoned: bool, // a failed append may have torn the active segment; roll before the next
 }
 
@@ -106,7 +110,7 @@ impl Wal {
 
         let mut entries = Vec::new();
         let mut closed = Vec::new();
-        let mut active_max_ts = 0u128;
+        let mut active_max_ts = HashMap::new();
         for (idx, &id) in ids.iter().enumerate() {
             let path = wal_dir.join(seg_name(id));
             let bytes = fs::read(&path)?;
@@ -130,11 +134,11 @@ impl Wal {
                     );
                 }
             }
-            let max_ts = seg_entries
-                .iter()
-                .map(|(_, _, r)| r.timestamp_ms)
-                .max()
-                .unwrap_or(0);
+            let mut max_ts: HashMap<String, u128> = HashMap::new();
+            for (stream, _, record) in &seg_entries {
+                let entry = max_ts.entry(stream.clone()).or_insert(0);
+                *entry = (*entry).max(record.timestamp_ms);
+            }
             if is_last {
                 active_max_ts = max_ts;
             } else {
@@ -180,7 +184,8 @@ impl Wal {
             return Err(err);
         }
         self.active_bytes += frame.len() as u64;
-        self.active_max_ts = self.active_max_ts.max(record.timestamp_ms);
+        let entry = self.active_max_ts.entry(stream.to_string()).or_insert(0);
+        *entry = (*entry).max(record.timestamp_ms);
         Ok(())
     }
 
@@ -189,19 +194,22 @@ impl Wal {
         self.active.flush() // to OS buffer; survives process crash (no fsync by design)
     }
 
-    /// Delete closed segments whose newest record is older than retention. The
-    /// active segment is never dropped. `retention_secs == 0` means keep forever.
-    /// Returns how many segments were deleted.
-    pub fn drop_expired(&mut self, now_ms: u128, retention_secs: u64) -> io::Result<usize> {
-        if retention_secs == 0 {
-            return Ok(0);
-        }
-        let cutoff = retention_secs as u128 * 1000;
+    /// Delete closed segments whose records are all past their per-stream
+    /// retention. The active segment is never dropped. `retentions` maps each
+    /// current stream to its retention (seconds); a stream with retention 0, or
+    /// one still present but never listed, keeps its segments forever. A stream
+    /// absent from the map no longer exists, so its records won't replay and its
+    /// segments are free to drop. Returns how many segments were deleted.
+    pub fn drop_expired(
+        &mut self,
+        now_ms: u128,
+        retentions: &HashMap<String, u64>,
+    ) -> io::Result<usize> {
         let mut dropped = 0;
         let mut keep = Vec::with_capacity(self.closed.len());
         let mut first_err: Option<io::Error> = None;
         for seg in std::mem::take(&mut self.closed) {
-            if now_ms.saturating_sub(seg.max_ts) <= cutoff {
+            if !segment_expired(&seg, now_ms, retentions) {
                 keep.push(seg);
                 continue;
             }
@@ -230,16 +238,29 @@ impl Wal {
         self.active.flush()?;
         self.closed.push(Segment {
             path: self.dir.join(seg_name(self.active_id)),
-            max_ts: self.active_max_ts,
+            max_ts: std::mem::take(&mut self.active_max_ts),
         });
         self.active_id += 1;
         let path = self.dir.join(seg_name(self.active_id));
         self.active = BufWriter::new(OpenOptions::new().create(true).append(true).open(path)?);
         self.active_bytes = 0;
-        self.active_max_ts = 0;
         self.poisoned = false;
         Ok(())
     }
+}
+
+/// A closed segment is droppable once every stream it holds records for is safe
+/// to drop: the stream is gone (its records won't replay), or has a finite
+/// retention its newest record here has outlived. Retention 0 (keep forever)
+/// pins the segment.
+fn segment_expired(seg: &Segment, now_ms: u128, retentions: &HashMap<String, u64>) -> bool {
+    seg.max_ts
+        .iter()
+        .all(|(stream, &max_ts)| match retentions.get(stream).copied() {
+            None => true,
+            Some(0) => false,
+            Some(retention) => now_ms.saturating_sub(max_ts) > retention as u128 * 1000,
+        })
 }
 
 #[cfg(test)]
@@ -473,7 +494,8 @@ mod tests {
         )
         .unwrap();
         // now = 10_000_000 ms, retention 1s (1000 ms): segment 1 (max_ts 1000) is expired, segment 2 is not.
-        let dropped = wal.drop_expired(10_000_000, 1).unwrap();
+        let retentions = HashMap::from([("S".to_string(), 1u64)]);
+        let dropped = wal.drop_expired(10_000_000, &retentions).unwrap();
         assert_eq!(dropped, 1);
         // active segment is never dropped even if it looks old
         let _ = fs::remove_dir_all(&dir);
@@ -492,27 +514,29 @@ mod tests {
         fs::create_dir(&bad).unwrap(); // remove_file on a dir errors (not NotFound)
         fs::write(&ok2, b"x").unwrap();
         // `gone` is never created, so its removal hits NotFound.
+        let ts = || HashMap::from([("S".to_string(), 1u128)]);
         wal.closed = vec![
             Segment {
                 path: ok1.clone(),
-                max_ts: 1,
+                max_ts: ts(),
             },
             Segment {
                 path: bad.clone(),
-                max_ts: 1,
+                max_ts: ts(),
             },
             Segment {
                 path: ok2.clone(),
-                max_ts: 1,
+                max_ts: ts(),
             },
             Segment {
                 path: gone.clone(),
-                max_ts: 1,
+                max_ts: ts(),
             },
         ];
 
         // now far in the future, retention 1s: every segment is expired.
-        let err = wal.drop_expired(1_000_000_000, 1).unwrap_err();
+        let retentions = HashMap::from([("S".to_string(), 1u64)]);
+        let err = wal.drop_expired(1_000_000_000, &retentions).unwrap_err();
         assert_ne!(err.kind(), io::ErrorKind::NotFound);
         // Removable files are gone; the failed segment stays tracked; the
         // already-missing segment is dropped rather than wedging the list.
@@ -523,9 +547,44 @@ mod tests {
 
         // Clear the failure, then the survivor drops cleanly on the next call.
         fs::remove_dir(&bad).unwrap();
-        assert_eq!(wal.drop_expired(1_000_000_000, 1).unwrap(), 1);
+        assert_eq!(wal.drop_expired(1_000_000_000, &retentions).unwrap(), 1);
         assert!(wal.closed.is_empty());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn drops_segments_per_stream_not_by_global_retention() {
+        let dir = tmp_dir("per-stream");
+        let (mut wal, _) = Wal::load(&dir, 16).unwrap(); // tiny cap: each record its own segment
+        wal_append(&mut wal, "EXP", 1, 1_000); // segment 1: only the 1-second stream's old record
+        wal_append(&mut wal, "KEEP", 2, 1_000); // segment 2: only the keep-forever stream's old record
+        wal_append(&mut wal, "EXP", 3, 10_000_000); // active segment keeps 1 & 2 closed
+
+        // EXP retains 1s, KEEP retains forever (0). At now=10_000_000 the EXP
+        // segment is long expired while the KEEP segment must survive.
+        let retentions = HashMap::from([("EXP".to_string(), 1u64), ("KEEP".to_string(), 0u64)]);
+        let dropped = wal.drop_expired(10_000_000, &retentions).unwrap();
+        assert_eq!(dropped, 1, "only the expired stream's segment drops");
+        assert_eq!(
+            wal.closed.len(),
+            1,
+            "the keep-forever segment stays tracked"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn wal_append(wal: &mut Wal, stream: &str, seq: u64, timestamp_ms: u128) {
+        wal.append(
+            stream,
+            "shardId-000000000000",
+            &Record {
+                seq,
+                partition_key: "p".into(),
+                data: vec![0u8; 20],
+                timestamp_ms,
+            },
+        )
+        .unwrap();
     }
 
     #[test]

@@ -179,17 +179,17 @@ fn spawn_maintenance(
             // Persist the manifest (carrying the current seq high-water) BEFORE
             // dropping segments so a crash can't lose it. Lock discipline is
             // store-then-wal: release the store read lock before taking the wal.
-            let retention = {
+            let retentions = {
                 let store = store.read().expect("store lock poisoned");
                 if let Err(err) = manifest::save(std::path::Path::new(dir), &store) {
                     eprintln!("fakestream: manifest save failed: {err}");
                 }
-                store.max_retention_secs()
+                store.stream_retentions()
             };
             if let Err(err) = wal
                 .lock()
                 .expect("wal lock poisoned")
-                .drop_expired(now, retention)
+                .drop_expired(now, &retentions)
             {
                 eprintln!("fakestream: segment drop failed: {err}");
             }
