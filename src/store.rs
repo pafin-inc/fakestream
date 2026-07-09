@@ -65,8 +65,7 @@ pub struct Iterator {
 pub fn now_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_millis())
 }
 
 /// Hash a partition key into the 128-bit ring the way Kinesis does (MD5, big-endian).

@@ -39,8 +39,7 @@ impl Metrics {
         }
         let start_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
         Metrics {
             put_records: AtomicU64::new(0),
             get_records: AtomicU64::new(0),
