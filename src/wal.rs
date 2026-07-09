@@ -316,6 +316,63 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn recreated_stream_drops_records_predating_creation() {
+        let dir = tmp_dir("resurrect");
+        let shard = "shardId-000000000000";
+        // first "process": S existed, took records, was deleted, then recreated
+        // under the same name (shard IDs are deterministic, so they collide).
+        // The append-only WAL still holds the deleted incarnation's records.
+        {
+            let mut store = Store::new(86_400);
+            store.create_stream("S", 1, None);
+            let (mut wal, _) = Wal::load(&dir, 1 << 20).unwrap();
+            for seq in 1..=3u64 {
+                let old = Record {
+                    seq,
+                    partition_key: "old".into(),
+                    data: vec![seq as u8],
+                    timestamp_ms: 100,
+                };
+                wal.append("S", shard, &old).unwrap();
+            }
+            store.streams.remove("S");
+            store.create_stream("S", 1, None);
+            store.streams.get_mut("S").unwrap().created_ms = 1_000;
+            // seq 4 lands in the same millisecond as creation and must be kept;
+            // seq 5 clearly post-dates it.
+            for (seq, ts) in [(4u64, 1_000u128), (5, 2_000)] {
+                let new = Record {
+                    seq,
+                    partition_key: "new".into(),
+                    data: vec![seq as u8],
+                    timestamp_ms: ts,
+                };
+                wal.append("S", shard, &new).unwrap();
+            }
+            crate::manifest::save(&dir, &store).unwrap();
+        }
+        // second "process": reload via manifest + WAL replay.
+        let mut reloaded = crate::manifest::load(&dir).unwrap();
+        let (_wal, entries) = Wal::load(&dir, 1 << 20).unwrap();
+        for (s, sh, r) in entries {
+            reloaded.restore_record(&s, &sh, r);
+        }
+        assert_eq!(
+            reloaded
+                .stream_sizes()
+                .iter()
+                .map(|(_, n, _)| n)
+                .sum::<u64>(),
+            2,
+            "old records must not resurrect; boundary + newer records survive"
+        );
+        let last = reloaded.last_record("S", shard).unwrap();
+        assert_eq!(last.seq, 5);
+        assert_eq!(last.partition_key, "new");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     use proptest::prelude::*;
 
     proptest! {

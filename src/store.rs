@@ -237,6 +237,14 @@ impl Store {
         let Some(stream) = self.streams.get_mut(stream) else {
             return false;
         };
+        // Drop records written before this stream was created. Shard IDs are
+        // deterministic, so a delete-then-recreate of the same name reuses them;
+        // without this check a deleted stream's WAL records would resurrect in
+        // the recreated stream on replay. A record written in the same
+        // millisecond as creation still belongs to it, so the compare is strict.
+        if record.timestamp_ms < stream.created_ms {
+            return false;
+        }
         let Some(shard) = stream.shards.iter_mut().find(|s| s.id == shard_id) else {
             return false;
         };
@@ -319,6 +327,9 @@ mod tests {
     fn restore_record_preserves_seq_and_does_not_increment_counter() {
         let mut s = Store::new(86_400);
         s.create_stream("S", 1, None);
+        // rec()'s timestamp predates a real creation clock; float creation back
+        // so replay accepts it (the resurrection guard uses created_ms).
+        s.streams.get_mut("S").unwrap().created_ms = 0;
         assert!(s.restore_record("S", "shardId-000000000000", rec(42)));
         assert_eq!(s.last_record("S", "shardId-000000000000").unwrap().seq, 42);
         s.bump_seq_to(42);
