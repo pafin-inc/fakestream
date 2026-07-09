@@ -124,7 +124,7 @@ impl Store {
                 closed: false,
             });
         }
-        let arn = format!("arn:aws:kinesis:local:000000000000:stream/{name}");
+        let arn = format!("arn:aws:kinesis:us-east-1:000000000000:stream/{name}");
         let retention_secs = retention_secs.unwrap_or(self.default_retention_secs);
         self.streams.insert(
             name.to_string(),

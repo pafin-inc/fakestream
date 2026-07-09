@@ -24,6 +24,31 @@ fn require_str<'a>(req: &'a Value, key: &str) -> Result<&'a str, ApiError> {
         .ok_or_else(|| ApiError::validation(format!("Missing required parameter: {key}")))
 }
 
+/// Resolve the target stream name from a data-plane request. Since the 2022
+/// Kinesis API update these ops accept `StreamARN` in place of `StreamName`;
+/// clients commonly feed back the ARN returned by DescribeStream/ListStreams.
+/// Prefer `StreamName`; otherwise take the segment after the last `/` of a
+/// `StreamARN` that contains ":stream/".
+fn resolve_stream_name(req: &Value) -> Result<&str, ApiError> {
+    if let Some(name) = req.get("StreamName").and_then(Value::as_str) {
+        return Ok(name);
+    }
+    let Some(arn) = req.get("StreamARN").and_then(Value::as_str) else {
+        return Err(ApiError::validation(
+            "Missing required parameter: StreamName",
+        ));
+    };
+    let Some(name) = arn
+        .contains(":stream/")
+        .then(|| arn.rsplit('/').next())
+        .flatten()
+        .filter(|name| !name.is_empty())
+    else {
+        return Err(ApiError::validation(format!("Invalid StreamARN: {arn}")));
+    };
+    Ok(name)
+}
+
 fn parse_u128(text: &str, field: &str) -> Result<u128, ApiError> {
     text.parse::<u128>()
         .map_err(|_| ApiError::validation(format!("Invalid {field}: {text}")))
@@ -101,7 +126,7 @@ pub fn create_stream(store: &mut Store, req: &Value) -> Result<Value, ApiError> 
 }
 
 pub fn delete_stream(store: &mut Store, req: &Value) -> Result<Value, ApiError> {
-    let name = require_str(req, "StreamName")?;
+    let name = resolve_stream_name(req)?;
     if store.streams.remove(name).is_none() {
         return Err(ApiError::not_found(format!("Stream {name} not found")));
     }
@@ -113,7 +138,7 @@ pub fn put_record(
     wal: Option<&mut Wal>,
     req: &Value,
 ) -> Result<Value, ApiError> {
-    let name = require_str(req, "StreamName")?;
+    let name = resolve_stream_name(req)?;
     let partition_key = require_str(req, "PartitionKey")?.to_string();
     let data = decode_data(require_str(req, "Data")?)?;
     if data.len() > MAX_RECORD_BYTES {
@@ -144,7 +169,7 @@ pub fn put_records(
     mut wal: Option<&mut Wal>,
     req: &Value,
 ) -> Result<Value, ApiError> {
-    let name = require_str(req, "StreamName")?;
+    let name = resolve_stream_name(req)?;
     if !store.streams.contains_key(name) {
         return Err(ApiError::not_found(format!("Stream {name} not found")));
     }
@@ -226,7 +251,7 @@ pub fn list_streams(store: &Store, _req: &Value) -> Result<Value, ApiError> {
 }
 
 pub fn describe_stream(store: &Store, req: &Value) -> Result<Value, ApiError> {
-    let stream = lookup(store, require_str(req, "StreamName")?)?;
+    let stream = lookup(store, resolve_stream_name(req)?)?;
     let shards: Vec<Value> = stream.shards.iter().map(shard_json).collect();
     Ok(json!({
         "StreamDescription": {
@@ -245,7 +270,7 @@ pub fn describe_stream(store: &Store, req: &Value) -> Result<Value, ApiError> {
 }
 
 pub fn describe_stream_summary(store: &Store, req: &Value) -> Result<Value, ApiError> {
-    let stream = lookup(store, require_str(req, "StreamName")?)?;
+    let stream = lookup(store, resolve_stream_name(req)?)?;
     let open = stream.shards.iter().filter(|s| !s.closed).count();
     Ok(json!({
         "StreamDescriptionSummary": {
@@ -263,17 +288,13 @@ pub fn describe_stream_summary(store: &Store, req: &Value) -> Result<Value, ApiE
 }
 
 pub fn list_shards(store: &Store, req: &Value) -> Result<Value, ApiError> {
-    let name = req
-        .get("StreamName")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ApiError::validation("StreamName is required"))?;
-    let stream = lookup(store, name)?;
+    let stream = lookup(store, resolve_stream_name(req)?)?;
     let shards: Vec<Value> = stream.shards.iter().map(shard_json).collect();
     Ok(json!({ "Shards": shards }))
 }
 
 pub fn get_shard_iterator(store: &Store, req: &Value) -> Result<Value, ApiError> {
-    let name = require_str(req, "StreamName")?;
+    let name = resolve_stream_name(req)?;
     let shard_id = require_str(req, "ShardId")?;
     let iterator_type = require_str(req, "ShardIteratorType")?;
     let starting =
@@ -519,6 +540,25 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, "S"); // stream name recorded
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn describe_stream_accepts_stream_arn() {
+        let store = store_with_stream();
+        let arn = store.streams["S"].arn.clone();
+        let out = describe_stream(&store, &json!({ "StreamARN": arn })).unwrap();
+        assert_eq!(out["StreamDescription"]["StreamName"], "S");
+    }
+
+    #[test]
+    fn describe_stream_rejects_malformed_arn() {
+        let store = store_with_stream();
+        assert_eq!(
+            describe_stream(&store, &json!({ "StreamARN": "not-an-arn" }))
+                .unwrap_err()
+                .kind,
+            "ValidationException"
+        );
     }
 
     // ---- GetRecords serialization + 10 MiB cap ---------------------------------
