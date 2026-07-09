@@ -308,6 +308,26 @@ pub fn get_shard_iterator(store: &Store, req: &Value) -> Result<Value, ApiError>
         .get("Timestamp")
         .and_then(Value::as_f64)
         .map(|secs| (secs * 1000.0) as u128);
+    // Classify argument errors before touching the store so a bad iterator type
+    // or a missing StartingSequenceNumber doesn't masquerade as a deleted shard.
+    match iterator_type {
+        "TRIM_HORIZON" | "LATEST" | "AT_TIMESTAMP" => {}
+        "AT_SEQUENCE_NUMBER" | "AFTER_SEQUENCE_NUMBER" => {
+            if starting.is_none() {
+                return Err(ApiError::new(
+                    "InvalidArgumentException",
+                    format!(
+                        "StartingSequenceNumber is required for ShardIteratorType {iterator_type}"
+                    ),
+                ));
+            }
+        }
+        other => {
+            return Err(ApiError::validation(format!(
+                "Invalid ShardIteratorType: {other}"
+            )));
+        }
+    }
     lookup(store, name)?;
     let it = store
         .make_iterator(name, shard_id, iterator_type, starting, timestamp_ms)
@@ -558,6 +578,42 @@ mod tests {
                 .unwrap_err()
                 .kind,
             "ValidationException"
+        );
+    }
+
+    // ---- GetShardIterator argument classification ------------------------------
+
+    fn iterator_req(shard_id: &str, iterator_type: &str) -> Value {
+        json!({ "StreamName": "S", "ShardId": shard_id, "ShardIteratorType": iterator_type })
+    }
+
+    #[test]
+    fn get_shard_iterator_rejects_unknown_type() {
+        let store = store_with_stream();
+        let req = iterator_req("shardId-000000000000", "BOGUS");
+        assert_eq!(
+            get_shard_iterator(&store, &req).unwrap_err().kind,
+            "ValidationException"
+        );
+    }
+
+    #[test]
+    fn get_shard_iterator_requires_sequence_number() {
+        let store = store_with_stream();
+        let req = iterator_req("shardId-000000000000", "AT_SEQUENCE_NUMBER");
+        assert_eq!(
+            get_shard_iterator(&store, &req).unwrap_err().kind,
+            "InvalidArgumentException"
+        );
+    }
+
+    #[test]
+    fn get_shard_iterator_unknown_shard_is_not_found() {
+        let store = store_with_stream();
+        let req = iterator_req("shardId-000000000099", "TRIM_HORIZON");
+        assert_eq!(
+            get_shard_iterator(&store, &req).unwrap_err().kind,
+            "ResourceNotFoundException"
         );
     }
 
