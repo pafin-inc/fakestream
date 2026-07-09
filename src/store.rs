@@ -106,14 +106,14 @@ impl Store {
             return false;
         }
         let count = shard_count.max(1);
-        let step = u128::MAX / count as u128;
+        let step = u128::MAX / u128::from(count);
         let mut shards = Vec::with_capacity(count as usize);
         for i in 0..count {
-            let hash_start = i as u128 * step;
+            let hash_start = u128::from(i) * step;
             let hash_end = if i == count - 1 {
                 u128::MAX
             } else {
-                (i as u128 + 1) * step - 1
+                (u128::from(i) + 1) * step - 1
             };
             shards.push(Shard {
                 id: shard_id(i),
@@ -145,7 +145,7 @@ impl Store {
             if stream.retention_secs == 0 {
                 continue;
             }
-            let cutoff_ms = (stream.retention_secs as u128) * 1000;
+            let cutoff_ms = u128::from(stream.retention_secs) * 1000;
             for shard in &mut stream.shards {
                 let before = shard.records.len();
                 shard
@@ -300,7 +300,7 @@ fn resolve_start(
     starting_seq: Option<u64>,
     timestamp_ms: Option<u128>,
 ) -> Option<u64> {
-    let latest = shard.records.last().map(|r| r.seq).unwrap_or(0);
+    let latest = shard.records.last().map_or(0, |r| r.seq);
     match iterator_type {
         "TRIM_HORIZON" => Some(0),
         "LATEST" => Some(latest + 1),

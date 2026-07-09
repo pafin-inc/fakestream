@@ -63,7 +63,7 @@ fn hash_key_range(shard: &Shard) -> Value {
 }
 
 fn shard_json(shard: &Shard) -> Value {
-    let starting = shard.records.first().map(|r| r.seq).unwrap_or(0);
+    let starting = shard.records.first().map_or(0, |r| r.seq);
     json!({
         "ShardId": shard.id,
         "HashKeyRange": hash_key_range(shard),
@@ -442,13 +442,11 @@ pub fn get_records(store: &Store, req: &Value) -> Result<(Vec<u8>, u64, u64), Ap
         selected.push(record);
     }
 
-    let latest_seq = shard.records.last().map(|r| r.seq).unwrap_or(0);
+    let latest_seq = shard.records.last().map_or(0, |r| r.seq);
     let millis_behind = if next_seq > latest_seq {
         0
     } else {
-        last_ts
-            .map(|ts| now_ms().saturating_sub(ts) as u64)
-            .unwrap_or(0)
+        last_ts.map_or(0, |ts| now_ms().saturating_sub(ts) as u64)
     };
     let next = Iterator {
         next_seq,
@@ -692,21 +690,21 @@ mod tests {
         assert_eq!(create("").unwrap_err().kind, "ValidationException");
     }
 
-    fn create_full(req: Value) -> Result<Value, ApiError> {
-        create_stream(&mut Store::new(86_400), &req)
+    fn create_full(req: &Value) -> Result<Value, ApiError> {
+        create_stream(&mut Store::new(86_400), req)
     }
 
     #[test]
     fn create_stream_accepts_shard_count_boundaries() {
-        assert!(create_full(json!({ "StreamName": "S", "ShardCount": 1 })).is_ok());
-        assert!(create_full(json!({ "StreamName": "S", "ShardCount": 10_000 })).is_ok());
+        assert!(create_full(&json!({ "StreamName": "S", "ShardCount": 1 })).is_ok());
+        assert!(create_full(&json!({ "StreamName": "S", "ShardCount": 10_000 })).is_ok());
     }
 
     #[test]
     fn create_stream_rejects_bad_shard_count() {
         for value in [json!(0), json!(10_001), json!(1.5)] {
             assert_eq!(
-                create_full(json!({ "StreamName": "S", "ShardCount": value }))
+                create_full(&json!({ "StreamName": "S", "ShardCount": value }))
                     .unwrap_err()
                     .kind,
                 "ValidationException"
@@ -716,14 +714,14 @@ mod tests {
 
     #[test]
     fn create_stream_accepts_short_retention() {
-        let out = create_full(json!({ "StreamName": "S", "RetentionPeriodHours": 1 }));
+        let out = create_full(&json!({ "StreamName": "S", "RetentionPeriodHours": 1 }));
         assert!(out.is_ok());
     }
 
     #[test]
     fn create_stream_rejects_overflowing_retention() {
         assert_eq!(
-            create_full(json!({ "StreamName": "S", "RetentionPeriodHours": u64::MAX }))
+            create_full(&json!({ "StreamName": "S", "RetentionPeriodHours": u64::MAX }))
                 .unwrap_err()
                 .kind,
             "ValidationException"

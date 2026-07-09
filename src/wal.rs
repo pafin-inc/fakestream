@@ -97,7 +97,7 @@ impl Wal {
         fs::create_dir_all(&wal_dir)?;
 
         let mut ids: Vec<u64> = fs::read_dir(&wal_dir)?
-            .filter_map(|e| e.ok())
+            .filter_map(Result::ok)
             .filter_map(|e| {
                 let name = e.file_name().into_string().ok()?;
                 name.strip_prefix("seg-")?
@@ -259,7 +259,7 @@ fn segment_expired(seg: &Segment, now_ms: u128, retentions: &HashMap<String, u64
         .all(|(stream, &max_ts)| match retentions.get(stream).copied() {
             None => true,
             Some(0) => false,
-            Some(retention) => now_ms.saturating_sub(max_ts) > retention as u128 * 1000,
+            Some(retention) => now_ms.saturating_sub(max_ts) > u128::from(retention) * 1000,
         })
 }
 

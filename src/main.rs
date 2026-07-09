@@ -278,7 +278,7 @@ fn route(
         )
     })?;
     let req: Value = if body.trim().is_empty() {
-        Value::Object(Default::default())
+        Value::Object(serde_json::Map::new())
     } else {
         serde_json::from_str(body).map_err(|_| {
             ApiError::new("SerializationException", "Request body is not valid JSON")
@@ -331,8 +331,7 @@ fn route(
                 let bytes = req
                     .get("Data")
                     .and_then(Value::as_str)
-                    .map(b64_decoded_len)
-                    .unwrap_or(0);
+                    .map_or(0, b64_decoded_len);
                 metrics.add_put(1, bytes);
             }
             "PutRecords" => {
@@ -367,8 +366,7 @@ fn successful_put_metrics(request_records: &[Value], response_records: &[Value])
         bytes += request
             .get("Data")
             .and_then(Value::as_str)
-            .map(b64_decoded_len)
-            .unwrap_or(0);
+            .map_or(0, b64_decoded_len);
     }
     (records, bytes)
 }

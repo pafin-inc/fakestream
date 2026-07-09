@@ -2,6 +2,7 @@
 name = "fakestream"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.90"
 description = "Minimal, low-memory local Amazon Kinesis Data Streams emulator"
 license = "MIT"
 repository = "https://github.com/pafin-inc/fakestream"
@@ -30,3 +31,28 @@ strip = true
 
 [dev-dependencies]
 proptest = "1.11.0"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "allow"
+panic = "deny"
+panic_in_result_fn = "deny"
+unimplemented = "deny"
+allow_attributes = "deny"
+dbg_macro = "deny"
+todo = "deny"
+print_stdout = "allow"
+print_stderr = "allow"
+await_holding_lock = "deny"
+exit = "deny"
+mem_forget = "deny"
+module_name_repetitions = "allow"
+similar_names = "allow"
+doc_markdown = "allow"
+format_push_string = "allow"
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+ref_option = "allow"
+unnecessary_wraps = "allow"
