@@ -14,6 +14,7 @@ mod protocol;
 mod store;
 mod wal;
 
+use std::io::Read;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
@@ -31,6 +32,9 @@ const WORKER_THREADS: usize = 4;
 const DEFAULT_PERSIST_INTERVAL_SECS: u64 = 5;
 const DEFAULT_RETENTION_SECS: u64 = 24 * 3600;
 const DEFAULT_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
+// 16 MiB, comfortably above the 5 MiB PutRecords decoded limit after base64 +
+// JSON inflation. Bounds per-request memory against an oversized body.
+const MAX_REQUEST_BODY_BYTES: u64 = 16 * 1024 * 1024;
 
 /// A handled operation's result: a small `Value` for most ops, or a pre-built
 /// JSON body for GetRecords (serialized in `ops` straight into one buffer to
@@ -234,10 +238,20 @@ fn handle(
         .map(|h| h.value.as_str().to_string());
 
     let mut body = String::new();
-    if request.as_reader().read_to_string(&mut body).is_err() {
+    // Read one byte past the cap with `take` so an oversized body is detected
+    // without ever buffering more than the limit.
+    let mut reader = request.as_reader().take(MAX_REQUEST_BODY_BYTES + 1);
+    if reader.read_to_string(&mut body).is_err() {
         respond_error(
             request,
             &ApiError::new("SerializationException", "Unreadable request body"),
+        );
+        return;
+    }
+    if body.len() as u64 > MAX_REQUEST_BODY_BYTES {
+        respond_error(
+            request,
+            &ApiError::validation("Request body exceeds the 16 MiB limit"),
         );
         return;
     }
