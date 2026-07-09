@@ -109,8 +109,30 @@ fn decode_iterator(token: &str) -> Result<Iterator, ApiError> {
 
 // ---- write operations -------------------------------------------------------
 
+/// Enforce the Kinesis stream-name constraint `[a-zA-Z0-9_.-]{1,128}`. Also
+/// guards the Prometheus exposition, where the name is interpolated into a label.
+fn validate_stream_name(name: &str) -> Result<(), ApiError> {
+    if name.is_empty() || name.len() > 128 {
+        return Err(ApiError::validation(format!(
+            "1 validation error detected: Value '{name}' at 'streamName' failed to satisfy \
+             constraint: Member must have length between 1 and 128"
+        )));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
+    {
+        return Err(ApiError::validation(format!(
+            "1 validation error detected: Value '{name}' at 'streamName' failed to satisfy \
+             constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
+        )));
+    }
+    Ok(())
+}
+
 pub fn create_stream(store: &mut Store, req: &Value) -> Result<Value, ApiError> {
     let name = require_str(req, "StreamName")?;
+    validate_stream_name(name)?;
     let shard_count = req.get("ShardCount").and_then(Value::as_u64).unwrap_or(1) as u32;
     let retention_secs = req
         .get("RetentionPeriodHours")
@@ -579,6 +601,35 @@ mod tests {
                 .kind,
             "ValidationException"
         );
+    }
+
+    // ---- CreateStream name validation ------------------------------------------
+
+    fn create(name: &str) -> Result<Value, ApiError> {
+        create_stream(&mut Store::new(86_400), &json!({ "StreamName": name }))
+    }
+
+    #[test]
+    fn create_stream_accepts_128_char_name() {
+        assert!(create(&"a".repeat(128)).is_ok());
+    }
+
+    #[test]
+    fn create_stream_rejects_129_char_name() {
+        assert_eq!(
+            create(&"a".repeat(129)).unwrap_err().kind,
+            "ValidationException"
+        );
+    }
+
+    #[test]
+    fn create_stream_rejects_illegal_characters() {
+        assert_eq!(create("bad\"name").unwrap_err().kind, "ValidationException");
+    }
+
+    #[test]
+    fn create_stream_rejects_empty_name() {
+        assert_eq!(create("").unwrap_err().kind, "ValidationException");
     }
 
     // ---- GetShardIterator argument classification ------------------------------
