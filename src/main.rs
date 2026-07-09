@@ -325,7 +325,7 @@ fn route(
         )),
     };
 
-    if result.is_ok() {
+    if let Ok(response) = &result {
         match op {
             "PutRecord" => {
                 let bytes = req
@@ -336,13 +336,13 @@ fn route(
                 metrics.add_put(1, bytes);
             }
             "PutRecords" => {
-                if let Some(records) = req.get("Records").and_then(Value::as_array) {
-                    let bytes = records
-                        .iter()
-                        .filter_map(|r| r.get("Data").and_then(Value::as_str))
-                        .map(b64_decoded_len)
-                        .sum();
-                    metrics.add_put(records.len() as u64, bytes);
+                if let (Some(request_records), Some(response_records)) = (
+                    req.get("Records").and_then(Value::as_array),
+                    response.get("Records").and_then(Value::as_array),
+                ) {
+                    let (records, bytes) =
+                        successful_put_metrics(request_records, response_records);
+                    metrics.add_put(records, bytes);
                 }
             }
             _ => {}
@@ -350,6 +350,27 @@ fn route(
     }
 
     result.map(OpResponse::Json)
+}
+
+/// Count records and decoded bytes for the PutRecords entries that succeeded,
+/// correlating each request record with its same-index response entry. Entries
+/// whose response carries an `ErrorCode` failed routing and are excluded so
+/// metrics never over-count a partially-failed batch.
+fn successful_put_metrics(request_records: &[Value], response_records: &[Value]) -> (u64, u64) {
+    let mut records = 0u64;
+    let mut bytes = 0u64;
+    for (request, result) in request_records.iter().zip(response_records) {
+        if result.get("ErrorCode").is_some() {
+            continue;
+        }
+        records += 1;
+        bytes += request
+            .get("Data")
+            .and_then(Value::as_str)
+            .map(b64_decoded_len)
+            .unwrap_or(0);
+    }
+    (records, bytes)
 }
 
 /// Run a write op under the store write lock, with the WAL locked alongside it
@@ -409,4 +430,34 @@ fn respond_error(request: Request, err: &ApiError) {
         .with_header(json_header())
         .with_header(error_type);
     let _ = request.respond(response);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn successful_put_metrics_excludes_failed_entries() {
+        let request = [json!({ "Data": "AAAA" }), json!({ "Data": "AAAA" })];
+        let response = [
+            json!({ "ShardId": "shardId-000000000000", "SequenceNumber": "1" }),
+            json!({ "ErrorCode": "InternalFailure", "ErrorMessage": "boom" }),
+        ];
+        let (records, bytes) = successful_put_metrics(&request, &response);
+        assert_eq!(records, 1);
+        assert_eq!(bytes, 3); // one "AAAA" decodes to 3 bytes
+    }
+
+    #[test]
+    fn successful_put_metrics_counts_all_when_none_failed() {
+        let request = [json!({ "Data": "AAAA" }), json!({ "Data": "AAA=" })];
+        let response = [
+            json!({ "ShardId": "shardId-000000000000", "SequenceNumber": "1" }),
+            json!({ "ShardId": "shardId-000000000000", "SequenceNumber": "2" }),
+        ];
+        let (records, bytes) = successful_put_metrics(&request, &response);
+        assert_eq!(records, 2);
+        assert_eq!(bytes, 5); // 3 + 2
+    }
 }
