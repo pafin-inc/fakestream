@@ -364,7 +364,15 @@ pub fn get_shard_iterator(store: &Store, req: &Value) -> Result<Value, ApiError>
     // Classify argument errors before touching the store so a bad iterator type
     // or a missing StartingSequenceNumber doesn't masquerade as a deleted shard.
     match iterator_type {
-        "TRIM_HORIZON" | "LATEST" | "AT_TIMESTAMP" => {}
+        "TRIM_HORIZON" | "LATEST" => {}
+        "AT_TIMESTAMP" => {
+            if timestamp_ms.is_none() {
+                return Err(ApiError::new(
+                    "InvalidArgumentException",
+                    "Timestamp is required for ShardIteratorType AT_TIMESTAMP",
+                ));
+            }
+        }
         "AT_SEQUENCE_NUMBER" | "AFTER_SEQUENCE_NUMBER" => {
             if starting.is_none() {
                 return Err(ApiError::new(
@@ -748,6 +756,16 @@ mod tests {
     fn get_shard_iterator_requires_sequence_number() {
         let store = store_with_stream();
         let req = iterator_req("shardId-000000000000", "AT_SEQUENCE_NUMBER");
+        assert_eq!(
+            get_shard_iterator(&store, &req).unwrap_err().kind,
+            "InvalidArgumentException"
+        );
+    }
+
+    #[test]
+    fn get_shard_iterator_requires_timestamp() {
+        let store = store_with_stream();
+        let req = iterator_req("shardId-000000000000", "AT_TIMESTAMP");
         assert_eq!(
             get_shard_iterator(&store, &req).unwrap_err().kind,
             "InvalidArgumentException"
