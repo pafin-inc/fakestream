@@ -16,7 +16,7 @@ const MAX_GET_RECORDS_BYTES: usize = 10 * 1_048_576; // 10 MiB, Kinesis GetRecor
 const RECORD_JSON_OVERHEAD: usize = 144; // fixed keys + quotes + seq/timestamp digits + comma
 const MAX_RECORD_BYTES: usize = 1_048_576; // 1 MiB, Kinesis data-blob limit (decoded)
 const MAX_PUT_RECORDS_COUNT: usize = 500;
-const MAX_SHARD_COUNT: u64 = 10_000; // Kinesis per-request CreateStream shard cap
+const MAX_SHARD_COUNT: u64 = 10_000; // local sanity cap; also blocks the old `as u32` truncation
 const MAX_PUT_RECORDS_AGGREGATE_BYTES: usize = 5 * 1_048_576; // 5 MiB, data + partition keys
 
 fn require_str<'a>(req: &'a Value, key: &str) -> Result<&'a str, ApiError> {
@@ -140,10 +140,9 @@ pub fn create_stream(store: &mut Store, req: &Value) -> Result<Value, ApiError> 
             .as_u64()
             .filter(|count| (1..=MAX_SHARD_COUNT).contains(count))
             .ok_or_else(|| {
-                ApiError::validation(
-                    "1 validation error detected: Value at 'shardCount' failed to satisfy \
-                     constraint: Member must have value between 1 and 10000",
-                )
+                ApiError::validation(format!(
+                    "ShardCount must be an integer between 1 and {MAX_SHARD_COUNT}"
+                ))
             })? as u32,
     };
     let retention_secs = match req.get("RetentionPeriodHours").and_then(Value::as_u64) {
