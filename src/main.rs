@@ -186,19 +186,19 @@ fn spawn_maintenance(
 /// dropping segments so a crash can't lose it — and if the save fails, the GC
 /// is skipped entirely: the on-disk manifest may still list a stream that was
 /// deleted in memory, and dropping its segments would let a crash recover the
-/// stream's definition with its records gone. Lock discipline is store-then-wal:
-/// the store read lock is released before the wal lock is taken.
+/// stream's definition with its records gone.
+///
+/// The store read lock is held across the whole pass — snapshot AND wal drop —
+/// so a concurrent `CreateStream` + roll can't slip a fresh closed segment past
+/// a stale retention snapshot and have GC delete its already-acked records. Lock
+/// order stays store-then-wal, matching `with_wal`, so this can't deadlock.
 fn persist_and_gc(store: &RwLock<Store>, wal: &Mutex<Wal>, dir: &std::path::Path, now: u128) {
-    let retentions = {
-        let store = store.read().expect("store lock poisoned");
-        match manifest::save(dir, &store) {
-            Ok(()) => store.stream_retentions(),
-            Err(err) => {
-                eprintln!("fakestream: manifest save failed: {err}");
-                return;
-            }
-        }
-    };
+    let store = store.read().expect("store lock poisoned");
+    if let Err(err) = manifest::save(dir, &store) {
+        eprintln!("fakestream: manifest save failed: {err}");
+        return;
+    }
+    let retentions = store.stream_retentions();
     if let Err(err) = wal
         .lock()
         .expect("wal lock poisoned")
