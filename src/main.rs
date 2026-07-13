@@ -56,6 +56,7 @@ struct Config {
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt()
         .with_target(false)
+        .with_ansi(false)
         .without_time()
         .init();
 
