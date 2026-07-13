@@ -150,9 +150,12 @@ Override only the **Kinesis** endpoint, leaving DynamoDB and other services unto
 - **Python producer (`boto3`)**: set `AWS_ENDPOINT_URL_KINESIS=http://localhost:4567` (service-specific).
 - **JS consumer (`aws-sdk-js v3`)**: set the Kinesis client `endpoint` to `http://localhost:4567`;
   leave the DynamoDB endpoint where it is.
-- **Java (`aws-sdk-java v1`/`v2`)**: these default to CBOR (`application/x-amz-cbor-1.1`), which
-  fakestream does not speak — clients fail with `SerializationException`. Disable it with
-  `AWS_CBOR_DISABLED=true` (env var) or `-Daws.cborEnabled=false` (system property) so the SDK sends JSON.
+Java SDK clients default to CBOR (`application/x-amz-cbor-1.1`), which fakestream does not
+speak. Configure the SDK to send JSON:
+
+- **Java (`aws-sdk-java v1`)**: set `AWS_CBOR_DISABLED=true` or
+  `-Dcom.amazonaws.sdk.disableCbor=true`.
+- **Java (`aws-sdk-java v2`)**: set `CBOR_ENABLED=false` or `-Daws.cborEnabled=false`.
 
 > Note: single-shard streams match the common single-shard consumer assumption. fakestream supports
 > `--shard-count N`, but a consumer that only reads the first `ListShards` page sees one shard.

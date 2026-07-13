@@ -74,10 +74,12 @@ Two files make up the persistent state:
   clean.
 
 The maintenance thread runs every `--persist-interval` seconds (default 5). It trims expired
-records in memory, saves the manifest (preserving the current seq high-water), then drops any
-closed WAL segments whose newest record is older than the stream's retention. Segment drops happen
-**after** the manifest save, so a crash can't lose the seq high-water. The only loss window is
-records appended since the last maintenance tick.
+records in memory and saves the manifest, preserving the current seq high-water. A closed segment
+is dropped only when every stream represented in it is safe: the stream was deleted, or its newest
+record in that segment is older than that stream's finite retention. Retention `0` pins every
+segment containing that stream. Segment drops happen only after a successful manifest save, so a
+crash can't lose the seq high-water. The only loss window is records appended since the last
+maintenance tick.
 
 `--segment-bytes` / `FAKESTREAM_SEGMENT_BYTES` controls the segment roll size (default 64 MiB).
 Smaller values mean more segments and more frequent drop-eligible boundaries; larger values reduce

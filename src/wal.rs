@@ -208,11 +208,10 @@ impl Wal {
     }
 
     /// Delete closed segments whose records are all past their per-stream
-    /// retention. The active segment is never dropped. `retentions` maps each
-    /// current stream to its retention (seconds); a stream with retention 0, or
-    /// one still present but never listed, keeps its segments forever. A stream
-    /// absent from the map no longer exists, so its records won't replay and its
-    /// segments are free to drop. Returns how many segments were deleted.
+    /// retention. The active segment is never dropped. `retentions` must contain
+    /// every current stream and map it to retention seconds. Retention 0 pins a
+    /// segment; an absent stream is treated as deleted, so its records no longer
+    /// pin the segment. Returns how many segments were deleted.
     pub fn drop_expired(
         &mut self,
         now_ms: u128,
