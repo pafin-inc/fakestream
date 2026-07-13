@@ -25,13 +25,31 @@ fn require_str<'a>(req: &'a Value, key: &str) -> Result<&'a str, ApiError> {
         .ok_or_else(|| ApiError::validation(format!("Missing required parameter: {key}")))
 }
 
-/// Extract the stream name from a `StreamARN` (the segment after the last `/`
-/// of an ARN that contains ":stream/").
+/// Validate a Kinesis stream ARN and extract its stream name.
 fn arn_stream_name(arn: &str) -> Option<&str> {
-    arn.contains(":stream/")
-        .then(|| arn.rsplit('/').next())
-        .flatten()
-        .filter(|name| !name.is_empty())
+    let mut fields = arn.splitn(6, ':');
+    let prefix = fields.next()?;
+    let partition = fields.next()?;
+    let service = fields.next()?;
+    let region = fields.next()?;
+    let account = fields.next()?;
+    let resource = fields.next()?;
+
+    if prefix != "arn"
+        || !(partition == "aws" || partition.starts_with("aws-"))
+        || service != "kinesis"
+        || region.is_empty()
+        || account.len() != 12
+        || !account.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+
+    let name = resource.strip_prefix("stream/")?;
+    if name.is_empty() || name.contains('/') || validate_stream_name(name).is_err() {
+        return None;
+    }
+    Some(name)
 }
 
 /// Resolve the target stream name from a data-plane request. Since the 2022
@@ -40,8 +58,24 @@ fn arn_stream_name(arn: &str) -> Option<&str> {
 /// Prefer `StreamName`; when both are supplied they must agree, matching real
 /// Kinesis, rather than silently ignoring a mismatched ARN.
 fn resolve_stream_name(req: &Value) -> Result<&str, ApiError> {
-    let name = req.get("StreamName").and_then(Value::as_str);
-    let arn = req.get("StreamARN").and_then(Value::as_str);
+    let name = match req.get("StreamName") {
+        None => None,
+        Some(Value::String(name)) => Some(name.as_str()),
+        Some(_) => {
+            return Err(ApiError::validation(
+                "StreamName must be a string when provided",
+            ));
+        }
+    };
+    let arn = match req.get("StreamARN") {
+        None => None,
+        Some(Value::String(arn)) => Some(arn.as_str()),
+        Some(_) => {
+            return Err(ApiError::validation(
+                "StreamARN must be a string when provided",
+            ));
+        }
+    };
     match (name, arn) {
         (Some(name), Some(arn)) => {
             let arn_name = arn_stream_name(arn)
@@ -683,6 +717,39 @@ mod tests {
                 .kind,
             "ValidationException"
         );
+    }
+
+    #[test]
+    fn describe_stream_rejects_substring_only_arn() {
+        let store = store_with_stream();
+        let error =
+            describe_stream(&store, &json!({ "StreamARN": "garbage:stream/S" })).unwrap_err();
+        assert_eq!(error.kind, "ValidationException");
+    }
+
+    #[test]
+    fn describe_stream_rejects_extra_arn_resource_components() {
+        let store = store_with_stream();
+        let arn = "arn:aws:kinesis:us-east-1:000000000000:stream/other/S";
+        let error = describe_stream(&store, &json!({ "StreamARN": arn })).unwrap_err();
+        assert_eq!(error.kind, "ValidationException");
+    }
+
+    #[test]
+    fn describe_stream_rejects_non_string_stream_name() {
+        let store = store_with_stream();
+        let arn = store.streams["S"].arn.clone();
+        let error =
+            describe_stream(&store, &json!({ "StreamName": 123, "StreamARN": arn })).unwrap_err();
+        assert_eq!(error.kind, "ValidationException");
+    }
+
+    #[test]
+    fn describe_stream_rejects_non_string_stream_arn() {
+        let store = store_with_stream();
+        let error =
+            describe_stream(&store, &json!({ "StreamName": "S", "StreamARN": 123 })).unwrap_err();
+        assert_eq!(error.kind, "ValidationException");
     }
 
     #[test]
