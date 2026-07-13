@@ -78,7 +78,7 @@ pub struct Wal {
     segment_max: u64,
     closed: Vec<Segment>, // older, full segments (drop candidates)
     active_id: u64,
-    active: BufWriter<File>,
+    active: Option<BufWriter<File>>,
     active_bytes: u64,
     active_max_ts: HashMap<String, u128>,
     poisoned: bool, // a failed append may have torn the active segment; roll before the next
@@ -158,7 +158,7 @@ impl Wal {
                 segment_max,
                 closed,
                 active_id,
-                active: BufWriter::new(file),
+                active: Some(BufWriter::new(file)),
                 active_bytes,
                 active_max_ts,
                 poisoned: false,
@@ -189,9 +189,16 @@ impl Wal {
         Ok(())
     }
 
+    fn active_writer(&mut self) -> io::Result<&mut BufWriter<File>> {
+        self.active
+            .as_mut()
+            .ok_or_else(|| io::Error::other("WAL active writer is unavailable"))
+    }
+
     fn write_frame(&mut self, frame: &[u8]) -> io::Result<()> {
-        self.active.write_all(frame)?;
-        self.active.flush() // to OS buffer; survives process crash (no fsync by design)
+        let active = self.active_writer()?;
+        active.write_all(frame)?;
+        active.flush() // to OS buffer; survives process crash (no fsync by design)
     }
 
     /// Delete closed segments whose records are all past their per-stream
@@ -240,7 +247,10 @@ impl Wal {
             .create(true)
             .append(true)
             .open(self.dir.join(seg_name(next_id)))?;
-        let old = std::mem::replace(&mut self.active, BufWriter::new(file));
+        let old = self
+            .active
+            .replace(BufWriter::new(file))
+            .ok_or_else(|| io::Error::other("WAL active writer is unavailable"))?;
         if self.poisoned {
             // A failed append can leave the NACKed frame buffered (write_all
             // buffered it, flush failed). into_parts hands back the file without
@@ -261,6 +271,17 @@ impl Wal {
         self.active_bytes = 0;
         self.poisoned = false;
         Ok(())
+    }
+}
+
+impl Drop for Wal {
+    fn drop(&mut self) {
+        if !self.poisoned {
+            return;
+        }
+        if let Some(active) = self.active.take() {
+            drop(active.into_parts());
+        }
     }
 }
 
@@ -646,7 +667,7 @@ mod tests {
         // failed, so the bytes sit unflushed in the writer and the segment is
         // poisoned. Writing without flushing leaves the frame in the BufWriter.
         let nacked = encode_frame("S", "shardId-000000000000", &rec(2, vec![0xEE; 32]));
-        wal.active.write_all(&nacked).unwrap();
+        wal.active_writer().unwrap().write_all(&nacked).unwrap();
         wal.poisoned = true;
         // The next append rolls; the buffered NACKed frame must be discarded, not
         // flushed onto the closing segment's tail.
@@ -658,6 +679,30 @@ mod tests {
             entries.iter().map(|(_, _, r)| r.seq).collect::<Vec<_>>(),
             vec![1, 3],
             "the NACKed record must not resurrect on replay"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn poisoned_drop_discards_buffered_nacked_frame() {
+        let dir = tmp_dir("poison-drop");
+        let (mut wal, _) = Wal::load(&dir, 1 << 20).unwrap();
+        wal.append("S", "shardId-000000000000", &rec(1, vec![1]))
+            .unwrap();
+
+        let nacked = encode_frame("S", "shardId-000000000000", &rec(2, vec![0xEE; 32]));
+        wal.active_writer().unwrap().write_all(&nacked).unwrap();
+        wal.poisoned = true;
+        drop(wal);
+
+        let (_wal, entries) = Wal::load(&dir, 1 << 20).unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|(_, _, record)| record.seq)
+                .collect::<Vec<_>>(),
+            vec![1],
+            "dropping a poisoned WAL must not flush the NACKed record"
         );
         let _ = fs::remove_dir_all(&dir);
     }
