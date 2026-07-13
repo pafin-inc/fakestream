@@ -49,7 +49,7 @@ Current stable exact versions of `tracing` and `tracing-subscriber` will be adde
 Production `println!` and `eprintln!` calls will become severity-appropriate tracing events. Existing `expect()` calls will be handled as follows:
 
 - propagate or explicitly handle failures when they can occur at runtime;
-- recover lock guards from poisoning through a named helper where continuing is the existing desired service behavior;
+- fail fast with an error event and process abort when a lock is poisoned, preserving the existing stop-on-poison behavior without using panic macros;
 - use narrowly scoped, justified Clippy exceptions only for structurally infallible operations such as fixed static headers or serialization into an in-memory buffer.
 
 `Cargo.toml` will set:
