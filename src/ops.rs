@@ -25,29 +25,41 @@ fn require_str<'a>(req: &'a Value, key: &str) -> Result<&'a str, ApiError> {
         .ok_or_else(|| ApiError::validation(format!("Missing required parameter: {key}")))
 }
 
-/// Resolve the target stream name from a data-plane request. Since the 2022
-/// Kinesis API update these ops accept `StreamARN` in place of `StreamName`;
-/// clients commonly feed back the ARN returned by DescribeStream/ListStreams.
-/// Prefer `StreamName`; otherwise take the segment after the last `/` of a
-/// `StreamARN` that contains ":stream/".
-fn resolve_stream_name(req: &Value) -> Result<&str, ApiError> {
-    if let Some(name) = req.get("StreamName").and_then(Value::as_str) {
-        return Ok(name);
-    }
-    let Some(arn) = req.get("StreamARN").and_then(Value::as_str) else {
-        return Err(ApiError::validation(
-            "Missing required parameter: StreamName",
-        ));
-    };
-    let Some(name) = arn
-        .contains(":stream/")
+/// Extract the stream name from a `StreamARN` (the segment after the last `/`
+/// of an ARN that contains ":stream/").
+fn arn_stream_name(arn: &str) -> Option<&str> {
+    arn.contains(":stream/")
         .then(|| arn.rsplit('/').next())
         .flatten()
         .filter(|name| !name.is_empty())
-    else {
-        return Err(ApiError::validation(format!("Invalid StreamARN: {arn}")));
-    };
-    Ok(name)
+}
+
+/// Resolve the target stream name from a data-plane request. Since the 2022
+/// Kinesis API update these ops accept `StreamARN` in place of `StreamName`;
+/// clients commonly feed back the ARN returned by DescribeStream/ListStreams.
+/// Prefer `StreamName`; when both are supplied they must agree, matching real
+/// Kinesis, rather than silently ignoring a mismatched ARN.
+fn resolve_stream_name(req: &Value) -> Result<&str, ApiError> {
+    let name = req.get("StreamName").and_then(Value::as_str);
+    let arn = req.get("StreamARN").and_then(Value::as_str);
+    match (name, arn) {
+        (Some(name), Some(arn)) => {
+            let arn_name = arn_stream_name(arn)
+                .ok_or_else(|| ApiError::validation(format!("Invalid StreamARN: {arn}")))?;
+            if arn_name != name {
+                return Err(ApiError::validation(format!(
+                    "StreamARN {arn} does not match StreamName {name}"
+                )));
+            }
+            Ok(name)
+        }
+        (Some(name), None) => Ok(name),
+        (None, Some(arn)) => arn_stream_name(arn)
+            .ok_or_else(|| ApiError::validation(format!("Invalid StreamARN: {arn}"))),
+        (None, None) => Err(ApiError::validation(
+            "Missing required parameter: StreamName",
+        )),
+    }
 }
 
 fn parse_u128(text: &str, field: &str) -> Result<u128, ApiError> {
@@ -671,6 +683,26 @@ mod tests {
                 .kind,
             "ValidationException"
         );
+    }
+
+    #[test]
+    fn describe_stream_rejects_arn_name_mismatch() {
+        let store = store_with_stream();
+        let arn = store.streams["S"].arn.clone();
+        assert_eq!(
+            describe_stream(&store, &json!({ "StreamName": "other", "StreamARN": arn }))
+                .unwrap_err()
+                .kind,
+            "ValidationException"
+        );
+    }
+
+    #[test]
+    fn describe_stream_accepts_matching_name_and_arn() {
+        let store = store_with_stream();
+        let arn = store.streams["S"].arn.clone();
+        let out = describe_stream(&store, &json!({ "StreamName": "S", "StreamARN": arn })).unwrap();
+        assert_eq!(out["StreamDescription"]["StreamName"], "S");
     }
 
     // ---- CreateStream name validation ------------------------------------------
