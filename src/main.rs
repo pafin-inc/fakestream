@@ -251,8 +251,9 @@ fn handle(
         .map(|h| h.value.as_str().to_string());
 
     let mut body = String::new();
-    // Read one byte past the cap with `take` so an oversized body is detected
-    // without ever buffering more than the limit.
+    // Read one byte past the cap with `take`: an oversized body is detected
+    // after buffering at most one byte over the limit, without draining an
+    // arbitrarily large request.
     let mut reader = request.as_reader().take(MAX_REQUEST_BODY_BYTES + 1);
     if reader.read_to_string(&mut body).is_err() {
         respond_error(

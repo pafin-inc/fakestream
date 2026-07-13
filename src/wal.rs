@@ -208,10 +208,12 @@ impl Wal {
     }
 
     /// Delete closed segments whose records are all past their per-stream
-    /// retention. The active segment is never dropped. `retentions` must contain
-    /// every current stream and map it to retention seconds. Retention 0 pins a
-    /// segment; an absent stream is treated as deleted, so its records no longer
-    /// pin the segment. Returns how many segments were deleted.
+    /// retention. The active segment is never dropped. `retentions` maps each
+    /// current stream to its retention seconds; retention 0 pins a segment.
+    /// A stream absent from the map is treated as deleted — its records stop
+    /// pinning segments — so callers must include every live stream or risk
+    /// dropping its segments early. Returns how many entries left the closed
+    /// list: files deleted plus stale entries whose file was already gone.
     pub fn drop_expired(
         &mut self,
         now_ms: u128,
@@ -279,6 +281,10 @@ impl Wal {
     }
 }
 
+/// Discards (never flushes) a poisoned writer's buffered NACKed frame on
+/// shutdown; flushing here would resurrect a record the client was told had
+/// failed. Mirrors the poisoned branch of `roll` — this is the only shutdown
+/// path that takes the active writer, so don't remove it as "dead cleanup".
 impl Drop for Wal {
     fn drop(&mut self) {
         if !self.poisoned {
