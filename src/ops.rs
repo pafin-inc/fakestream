@@ -241,15 +241,37 @@ pub fn put_record(
         .put(name, partition_key, data, explicit)
         .ok_or_else(|| ApiError::not_found(format!("Stream {name} not found")))?;
     if let Some(wal) = wal {
-        let appended = store
-            .last_record(name, &shard_id)
-            .map(|rec| wal.append(name, &shard_id, rec));
-        if let Some(Err(err)) = appended {
+        let Some(rec) = store.last_record(name, &shard_id) else {
+            // Unreachable while `put` appends before returning, but if that
+            // invariant ever breaks the record must not be acked as durable
+            // without a WAL frame behind it.
+            tracing::error!(
+                stream = name,
+                shard_id = %shard_id,
+                seq,
+                "record missing after put; nothing appended to WAL"
+            );
+            return Err(ApiError::internal("Record could not be durably persisted"));
+        };
+        if let Err(err) = wal.append(name, &shard_id, rec) {
             // The record wasn't durably written; roll it back so we don't ack a
             // seq that vanishes on restart (which would let the seq high-water
             // regress and re-issue that number for a different record).
-            tracing::error!(error = %err, "WAL append failed");
-            store.pop_record(name, &shard_id, seq);
+            tracing::error!(
+                error = %err,
+                stream = name,
+                shard_id = %shard_id,
+                seq,
+                "WAL append failed"
+            );
+            if store.pop_record(name, &shard_id, seq).is_none() {
+                tracing::error!(
+                    stream = name,
+                    shard_id = %shard_id,
+                    seq,
+                    "rollback found no matching record at the shard tail"
+                );
+            }
             return Err(ApiError::internal("Record could not be durably persisted"));
         }
     }
@@ -310,14 +332,38 @@ pub fn put_records(
             return Err(ApiError::not_found(format!("Stream {name} not found")));
         };
         if let Some(wal) = wal.as_deref_mut() {
-            let appended = store
-                .last_record(name, &shard_id)
-                .map(|rec| wal.append(name, &shard_id, rec));
-            if let Some(Err(err)) = appended {
+            let Some(rec) = store.last_record(name, &shard_id) else {
+                tracing::error!(
+                    stream = name,
+                    shard_id = %shard_id,
+                    seq,
+                    "record missing after put; nothing appended to WAL"
+                );
+                failed += 1;
+                out.push(json!({
+                    "ErrorCode": "InternalFailure",
+                    "ErrorMessage": "Record could not be durably persisted",
+                }));
+                continue;
+            };
+            if let Err(err) = wal.append(name, &shard_id, rec) {
                 // Per-record failure: roll the record back and report it so the
                 // client can retry, mirroring real Kinesis partial-failure batches.
-                tracing::error!(error = %err, "WAL append failed");
-                store.pop_record(name, &shard_id, seq);
+                tracing::error!(
+                    error = %err,
+                    stream = name,
+                    shard_id = %shard_id,
+                    seq,
+                    "WAL append failed"
+                );
+                if store.pop_record(name, &shard_id, seq).is_none() {
+                    tracing::error!(
+                        stream = name,
+                        shard_id = %shard_id,
+                        seq,
+                        "rollback found no matching record at the shard tail"
+                    );
+                }
                 failed += 1;
                 out.push(json!({
                     "ErrorCode": "InternalFailure",
@@ -683,6 +729,26 @@ mod tests {
         let (_w, entries) = Wal::load(&dir, 1 << 20).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, "S"); // stream name recorded
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn put_record_returns_internal_failure_when_append_fails() {
+        use crate::wal::Wal;
+        let dir = std::env::temp_dir().join(format!("fs-ops-walfail1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = store_with_stream();
+        // segment_max 0 makes every append roll first; removing the wal dir then
+        // makes the roll's create-open fail, forcing a WAL append error.
+        let (mut wal, _) = Wal::load(&dir, 0).unwrap();
+        std::fs::remove_dir_all(dir.join("wal")).unwrap();
+        let err = put_record(&mut store, Some(&mut wal), &put_req(4)).unwrap_err();
+        assert_eq!(err.kind, "InternalFailure");
+        // Rolled back: the un-persisted record is not left in the store.
+        assert_eq!(
+            store.stream_sizes().iter().map(|(_, n, _)| n).sum::<u64>(),
+            0
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
