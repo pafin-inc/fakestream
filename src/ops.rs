@@ -145,11 +145,16 @@ pub fn create_stream(store: &mut Store, req: &Value) -> Result<Value, ApiError> 
                 ))
             })? as u32,
     };
-    let retention_secs = match req.get("RetentionPeriodHours").and_then(Value::as_u64) {
-        Some(hours) => Some(hours.checked_mul(3600).ok_or_else(|| {
-            ApiError::validation("RetentionPeriodHours is too large to represent")
-        })?),
+    let retention_secs = match req.get("RetentionPeriodHours") {
         None => None,
+        Some(value) => {
+            let hours = value.as_u64().ok_or_else(|| {
+                ApiError::validation("RetentionPeriodHours must be a non-negative integer")
+            })?;
+            Some(hours.checked_mul(3600).ok_or_else(|| {
+                ApiError::validation("RetentionPeriodHours is too large to represent")
+            })?)
+        }
     };
     if !store.create_stream(name, shard_count, retention_secs) {
         return Err(ApiError::new(
@@ -733,6 +738,18 @@ mod tests {
                 .kind,
             "ValidationException"
         );
+    }
+
+    #[test]
+    fn create_stream_rejects_mistyped_retention() {
+        for value in [json!(-1), json!(1.5), json!("24")] {
+            assert_eq!(
+                create_full(&json!({ "StreamName": "S", "RetentionPeriodHours": value }))
+                    .unwrap_err()
+                    .kind,
+                "ValidationException"
+            );
+        }
     }
 
     // ---- GetShardIterator argument classification ------------------------------
