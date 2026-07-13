@@ -235,14 +235,29 @@ impl Wal {
     }
 
     fn roll(&mut self) -> io::Result<()> {
-        self.active.flush()?;
+        let next_id = self.active_id + 1;
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.dir.join(seg_name(next_id)))?;
+        let old = std::mem::replace(&mut self.active, BufWriter::new(file));
+        if self.poisoned {
+            // A failed append can leave the NACKed frame buffered (write_all
+            // buffered it, flush failed). into_parts hands back the file without
+            // flushing, so those bytes are dropped instead of landing at the
+            // closing segment's tail on this roll (or on the writer's Drop),
+            // where a transient error clearing would resurrect a record the
+            // client was told had failed. Any prefix already flushed to the OS
+            // becomes tail garbage that closed-segment replay tolerates.
+            drop(old.into_parts());
+        } else {
+            old.into_inner().map_err(io::IntoInnerError::into_error)?;
+        }
         self.closed.push(Segment {
             path: self.dir.join(seg_name(self.active_id)),
             max_ts: std::mem::take(&mut self.active_max_ts),
         });
-        self.active_id += 1;
-        let path = self.dir.join(seg_name(self.active_id));
-        self.active = BufWriter::new(OpenOptions::new().create(true).append(true).open(path)?);
+        self.active_id = next_id;
         self.active_bytes = 0;
         self.poisoned = false;
         Ok(())
@@ -617,6 +632,32 @@ mod tests {
         assert_eq!(
             entries.iter().map(|(_, _, r)| r.seq).collect::<Vec<_>>(),
             vec![1, 2]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn poisoned_roll_discards_buffered_nacked_frame() {
+        let dir = tmp_dir("poison-discard");
+        let (mut wal, _) = Wal::load(&dir, 1 << 20).unwrap(); // large cap: no natural roll
+        wal.append("S", "shardId-000000000000", &rec(1, vec![1]))
+            .unwrap();
+        // Stand in for a failed append: write_all buffered the frame, flush then
+        // failed, so the bytes sit unflushed in the writer and the segment is
+        // poisoned. Writing without flushing leaves the frame in the BufWriter.
+        let nacked = encode_frame("S", "shardId-000000000000", &rec(2, vec![0xEE; 32]));
+        wal.active.write_all(&nacked).unwrap();
+        wal.poisoned = true;
+        // The next append rolls; the buffered NACKed frame must be discarded, not
+        // flushed onto the closing segment's tail.
+        wal.append("S", "shardId-000000000000", &rec(3, vec![3]))
+            .unwrap();
+        drop(wal);
+        let (_w, entries) = Wal::load(&dir, 1 << 20).unwrap();
+        assert_eq!(
+            entries.iter().map(|(_, _, r)| r.seq).collect::<Vec<_>>(),
+            vec![1, 3],
+            "the NACKed record must not resurrect on replay"
         );
         let _ = fs::remove_dir_all(&dir);
     }
