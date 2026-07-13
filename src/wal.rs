@@ -20,6 +20,10 @@ pub type Entry = (String, String, Record);
 
 /// Encode one framed entry: 8-byte LE length prefix + postcard body. Borrows the
 /// record (no payload clone).
+#[expect(
+    clippy::expect_used,
+    reason = "Record's concrete Serialize implementation cannot reject postcard encoding"
+)]
 pub fn encode_frame(stream: &str, shard_id: &str, record: &Record) -> Vec<u8> {
     #[derive(Serialize)]
     struct FrameRef<'a> {
@@ -46,7 +50,9 @@ pub fn decode_segment(bytes: &[u8]) -> (Vec<Entry>, usize) {
     let mut out = Vec::new();
     let mut off = 0usize;
     while off + 8 <= bytes.len() {
-        let len = u64::from_le_bytes(bytes[off..off + 8].try_into().expect("8 bytes")) as usize;
+        let mut length_bytes = [0u8; 8];
+        length_bytes.copy_from_slice(&bytes[off..off + 8]);
+        let len = u64::from_le_bytes(length_bytes) as usize;
         let body_start = off + 8;
         let body_end = match body_start.checked_add(len) {
             Some(end) if end <= bytes.len() => end,

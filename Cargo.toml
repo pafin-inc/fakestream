@@ -37,7 +37,7 @@ proptest = "1.11.0"
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 unwrap_used = "deny"
-expect_used = "allow"
+expect_used = "warn"
 panic = "deny"
 panic_in_result_fn = "deny"
 unimplemented = "deny"

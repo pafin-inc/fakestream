@@ -550,6 +550,10 @@ fn serialize_get_records(records: &[&Record], next_iterator: &str, millis_behind
 }
 
 /// Write a single record object, base64-encoding its data straight into `out`.
+#[expect(
+    clippy::expect_used,
+    reason = "serde_json writes to Vec<u8>, whose Write implementation is infallible"
+)]
 fn write_record(out: &mut Vec<u8>, record: &Record) {
     out.extend_from_slice(b"{\"SequenceNumber\":\"");
     out.extend_from_slice(record.seq.to_string().as_bytes());
@@ -566,6 +570,10 @@ fn write_record(out: &mut Vec<u8>, record: &Record) {
 }
 
 /// Write a properly-escaped JSON string (including the surrounding quotes).
+#[expect(
+    clippy::expect_used,
+    reason = "serde_json writes to Vec<u8>, whose Write implementation is infallible"
+)]
 fn write_json_string(out: &mut Vec<u8>, value: &str) {
     serde_json::to_writer(&mut *out, value).expect("string serialization is infallible");
 }

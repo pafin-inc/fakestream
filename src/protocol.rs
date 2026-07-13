@@ -67,6 +67,10 @@ pub fn encode_data(bytes: &[u8]) -> String {
 /// intermediate `String` allocation. The GetRecords serializer uses this to
 /// write record payloads straight into the response buffer. base64's alphabet
 /// contains no JSON-escape characters, so the output is safe between quotes.
+#[expect(
+    clippy::expect_used,
+    reason = "the output slice is sized to the exact padded base64 length"
+)]
 pub fn encode_data_into(bytes: &[u8], out: &mut Vec<u8>) {
     let need = bytes.len().div_ceil(3) * 4; // standard padded base64 length
     let start = out.len();

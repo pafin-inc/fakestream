@@ -236,10 +236,8 @@ fn handle(
     if request.method() == &Method::Get {
         if request.url() == "/metrics" {
             let body = metrics.render(&read(store));
-            let header =
-                Header::from_bytes(&b"Content-Type"[..], &b"text/plain; version=0.0.4"[..])
-                    .expect("static header is valid");
-            let _ = request.respond(Response::from_string(body).with_header(header));
+            let response = Response::from_string(body).with_header(metrics_header());
+            let _ = request.respond(response);
         } else {
             let _ = request.respond(Response::from_string("fakestream ok"));
         }
@@ -432,6 +430,19 @@ fn lock_wal(wal: &Mutex<Wal>) -> MutexGuard<'_, Wal> {
     })
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "fixed Content-Type bytes are a valid HTTP header"
+)]
+fn metrics_header() -> Header {
+    Header::from_bytes(&b"Content-Type"[..], &b"text/plain; version=0.0.4"[..])
+        .expect("static header is valid")
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "fixed Content-Type bytes are a valid HTTP header"
+)]
 fn json_header() -> Header {
     Header::from_bytes(&b"Content-Type"[..], &b"application/x-amz-json-1.1"[..])
         .expect("static header is valid")
@@ -447,6 +458,10 @@ fn respond_ok_body(request: Request, body: Vec<u8>) {
     let _ = request.respond(response);
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "ApiError kinds are fixed AWS exception names valid in an HTTP header"
+)]
 fn respond_error(request: Request, err: &ApiError) {
     let error_type = Header::from_bytes(&b"x-amzn-errortype"[..], err.kind.as_bytes())
         .expect("error kind is valid header value");
