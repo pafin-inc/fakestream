@@ -248,7 +248,7 @@ pub fn put_record(
             // The record wasn't durably written; roll it back so we don't ack a
             // seq that vanishes on restart (which would let the seq high-water
             // regress and re-issue that number for a different record).
-            eprintln!("fakestream: WAL append failed: {err}");
+            tracing::error!(error = %err, "WAL append failed");
             store.pop_record(name, &shard_id, seq);
             return Err(ApiError::internal("Record could not be durably persisted"));
         }
@@ -316,7 +316,7 @@ pub fn put_records(
             if let Some(Err(err)) = appended {
                 // Per-record failure: roll the record back and report it so the
                 // client can retry, mirroring real Kinesis partial-failure batches.
-                eprintln!("fakestream: WAL append failed: {err}");
+                tracing::error!(error = %err, "WAL append failed");
                 store.pop_record(name, &shard_id, seq);
                 failed += 1;
                 out.push(json!({

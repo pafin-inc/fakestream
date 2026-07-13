@@ -127,10 +127,10 @@ impl Wal {
                     // Corruption inside a closed segment: later frames in this
                     // segment stay unreadable, but segments after it still
                     // replay. Surface it rather than dropping bytes silently.
-                    eprintln!(
-                        "fakestream: WAL segment {} skipping {} byte(s) after a corrupt frame",
-                        path.display(),
-                        bytes.len() - good_off
+                    tracing::warn!(
+                        segment = %path.display(),
+                        skipped_bytes = bytes.len() - good_off,
+                        "WAL segment contains bytes after a corrupt frame"
                     );
                 }
             }

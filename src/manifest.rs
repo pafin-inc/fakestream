@@ -38,7 +38,7 @@ pub fn load(dir: &Path) -> Option<Store> {
     match serde_json::from_slice(&bytes) {
         Ok(store) => Some(store),
         Err(err) => {
-            eprintln!("fakestream: ignoring unreadable manifest: {err}");
+            tracing::warn!(error = %err, "ignoring unreadable manifest");
             None
         }
     }

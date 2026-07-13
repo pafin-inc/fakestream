@@ -15,7 +15,7 @@ mod store;
 mod wal;
 
 use std::io::Read;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread;
 use std::time::Duration;
 
@@ -53,20 +53,29 @@ struct Config {
     segment_bytes: u64,
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .without_time()
+        .init();
+
     let config = Config::load();
     let addr = format!("0.0.0.0:{}", config.port);
 
-    let server = Arc::new(Server::http(&addr).expect("failed to bind fakestream HTTP server"));
+    let server = Arc::new(Server::http(&addr)?);
     let (store, wal) = load_state(&config);
     let store = Arc::new(RwLock::new(store));
     let wal = wal.map(|w| Arc::new(Mutex::new(w)));
     let persist_dir = config.persist_dir.clone();
-    println!("fakestream listening on http://{addr} (Kinesis, AWS JSON 1.1)");
-    println!("  retention: {}s default", config.default_retention_secs);
-    match &persist_dir {
-        Some(dir) => println!("  persistence: {dir}"),
-        None => println!("  persistence: off"),
+    tracing::info!(address = %addr, "fakestream listening (Kinesis, AWS JSON 1.1)");
+    tracing::info!(
+        retention_secs = config.default_retention_secs,
+        "default retention"
+    );
+    if let Some(dir) = &persist_dir {
+        tracing::info!(path = %dir, "persistence enabled");
+    } else {
+        tracing::info!("persistence disabled");
     }
 
     spawn_maintenance(&store, &wal, &persist_dir, config.persist_interval_secs);
@@ -89,6 +98,7 @@ fn main() {
     for handle in handles {
         let _ = handle.join();
     }
+    Ok(())
 }
 
 impl Config {
@@ -135,7 +145,7 @@ fn load_state(config: &Config) -> (Store, Option<Wal>) {
     let (wal, entries) = match Wal::load(dir, config.segment_bytes) {
         Ok(pair) => pair,
         Err(err) => {
-            eprintln!("fakestream: WAL open failed ({err}); starting without persistence");
+            tracing::warn!(error = %err, "WAL open failed; starting without persistence");
             return (store, None);
         }
     };
@@ -151,7 +161,7 @@ fn load_state(config: &Config) -> (Store, Option<Wal>) {
     store.bump_seq_to(max_seq);
     let removed = store.trim_expired(now_ms());
     if removed > 0 {
-        println!("  replayed WAL, trimmed {removed} expired record(s)");
+        tracing::info!(removed, "replayed WAL and trimmed expired records");
     }
     (store, Some(wal))
 }
@@ -171,10 +181,7 @@ fn spawn_maintenance(
     thread::spawn(move || loop {
         thread::sleep(interval);
         let now = now_ms();
-        store
-            .write()
-            .expect("store lock poisoned")
-            .trim_expired(now);
+        write(&store).trim_expired(now);
         if let (Some(wal), Some(dir)) = (&wal, &persist_dir) {
             persist_and_gc(&store, wal, std::path::Path::new(dir), now);
         }
@@ -193,18 +200,14 @@ fn spawn_maintenance(
 /// a stale retention snapshot and have GC delete its already-acked records. Lock
 /// order stays store-then-wal, matching `with_wal`, so this can't deadlock.
 fn persist_and_gc(store: &RwLock<Store>, wal: &Mutex<Wal>, dir: &std::path::Path, now: u128) {
-    let store = store.read().expect("store lock poisoned");
+    let store = read(store);
     if let Err(err) = manifest::save(dir, &store) {
-        eprintln!("fakestream: manifest save failed: {err}");
+        tracing::error!(error = %err, "manifest save failed");
         return;
     }
     let retentions = store.stream_retentions();
-    if let Err(err) = wal
-        .lock()
-        .expect("wal lock poisoned")
-        .drop_expired(now, &retentions)
-    {
-        eprintln!("fakestream: segment drop failed: {err}");
+    if let Err(err) = lock_wal(wal).drop_expired(now, &retentions) {
+        tracing::error!(error = %err, "WAL segment drop failed");
     }
 }
 
@@ -389,10 +392,10 @@ fn with_wal(
     wal: &Option<Arc<Mutex<Wal>>>,
     f: impl FnOnce(&mut Store, Option<&mut Wal>) -> Result<Value, ApiError>,
 ) -> Result<Value, ApiError> {
-    let mut store = store.write().expect("store lock poisoned");
+    let mut store = write(store);
     match wal {
         Some(w) => {
-            let mut wal = w.lock().expect("wal lock poisoned");
+            let mut wal = lock_wal(w);
             f(&mut store, Some(&mut wal))
         }
         None => f(&mut store, None),
@@ -403,17 +406,30 @@ fn with_wal(
 fn save_manifest(persist_dir: &Option<String>, store: &Store) {
     if let Some(dir) = persist_dir {
         if let Err(err) = manifest::save(std::path::Path::new(dir), store) {
-            eprintln!("fakestream: manifest save failed: {err}");
+            tracing::error!(error = %err, "manifest save failed");
         }
     }
 }
 
-fn write(store: &Arc<RwLock<Store>>) -> std::sync::RwLockWriteGuard<'_, Store> {
-    store.write().expect("store lock poisoned")
+fn write(store: &RwLock<Store>) -> RwLockWriteGuard<'_, Store> {
+    store.write().unwrap_or_else(|_| {
+        tracing::error!("store write lock poisoned; aborting");
+        std::process::abort();
+    })
 }
 
-fn read(store: &Arc<RwLock<Store>>) -> std::sync::RwLockReadGuard<'_, Store> {
-    store.read().expect("store lock poisoned")
+fn read(store: &RwLock<Store>) -> RwLockReadGuard<'_, Store> {
+    store.read().unwrap_or_else(|_| {
+        tracing::error!("store read lock poisoned; aborting");
+        std::process::abort();
+    })
+}
+
+fn lock_wal(wal: &Mutex<Wal>) -> MutexGuard<'_, Wal> {
+    wal.lock().unwrap_or_else(|_| {
+        tracing::error!("WAL lock poisoned; aborting");
+        std::process::abort();
+    })
 }
 
 fn json_header() -> Header {
