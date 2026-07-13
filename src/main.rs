@@ -36,6 +36,18 @@ const DEFAULT_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 // JSON inflation. Bounds per-request memory against an oversized body.
 const MAX_REQUEST_BODY_BYTES: u64 = 16 * 1024 * 1024;
 
+/// Reject bodies that overran the 16 MiB cap. Callers read through
+/// `take(MAX_REQUEST_BODY_BYTES + 1)`, so a length past the cap means the
+/// request was oversized — the extra byte only exists to signal overflow.
+fn check_body_size(len: u64) -> Result<(), ApiError> {
+    if len > MAX_REQUEST_BODY_BYTES {
+        return Err(ApiError::validation(
+            "Request body exceeds the 16 MiB limit",
+        ));
+    }
+    Ok(())
+}
+
 /// A handled operation's result: a small `Value` for most ops, or a pre-built
 /// JSON body for GetRecords (serialized in `ops` straight into one buffer to
 /// keep the response memory bounded and predictable).
@@ -262,11 +274,8 @@ fn handle(
         );
         return;
     }
-    if body.len() as u64 > MAX_REQUEST_BODY_BYTES {
-        respond_error(
-            request,
-            &ApiError::validation("Request body exceeds the 16 MiB limit"),
-        );
+    if let Err(err) = check_body_size(body.len() as u64) {
+        respond_error(request, &err);
         return;
     }
 
@@ -480,6 +489,17 @@ mod tests {
     use crate::store::Record;
     use serde_json::json;
     use std::fs;
+
+    #[test]
+    fn body_size_check_accepts_cap_and_rejects_overflow() {
+        assert!(check_body_size(MAX_REQUEST_BODY_BYTES).is_ok());
+        assert_eq!(
+            check_body_size(MAX_REQUEST_BODY_BYTES + 1)
+                .unwrap_err()
+                .kind,
+            "ValidationException"
+        );
+    }
 
     #[test]
     fn failed_manifest_save_skips_wal_gc() {
