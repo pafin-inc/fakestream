@@ -453,10 +453,17 @@ pub fn get_shard_iterator(store: &Store, req: &Value) -> Result<Value, ApiError>
             })?),
             None => None,
         };
-    let timestamp_ms = req
-        .get("Timestamp")
-        .and_then(Value::as_f64)
-        .map(|secs| (secs * 1000.0) as u128);
+    let timestamp_ms = match req.get("Timestamp").and_then(Value::as_f64) {
+        None => None,
+        Some(secs) if secs < 0.0 => {
+            return Err(ApiError::validation(format!(
+                "Timestamp must not be before the Unix epoch: {secs}"
+            )));
+        }
+        // The cast is exact for any realistic epoch value and secs is
+        // non-negative here, so it cannot saturate to a misleading 0.
+        Some(secs) => Some((secs * 1000.0) as u128),
+    };
     // Classify argument errors before touching the store so a bad iterator type
     // or a missing StartingSequenceNumber doesn't masquerade as a deleted shard.
     match iterator_type {
@@ -971,6 +978,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn get_shard_iterator_rejects_negative_timestamp() {
+        let store = store_with_stream();
+        let mut req = iterator_req("shardId-000000000000", "AT_TIMESTAMP");
+        req["Timestamp"] = json!(-1);
+        assert_eq!(
+            get_shard_iterator(&store, &req).unwrap_err().kind,
+            "ValidationException"
+        );
+    }
+
     // ---- GetRecords serialization + 10 MiB cap ---------------------------------
 
     fn iterator_token(store: &Store, iterator_type: &str) -> String {
@@ -992,6 +1010,34 @@ mod tests {
         }
         let (body, count, bytes) = get_records(store, &req).unwrap();
         (serde_json::from_slice(&body).unwrap(), count, bytes)
+    }
+
+    #[test]
+    fn at_timestamp_iterator_reads_from_matching_record() {
+        let mut store = store_with_stream();
+        store.put("S", "pk".into(), vec![1], None);
+        let mut req = iterator_req("shardId-000000000000", "AT_TIMESTAMP");
+        req["Timestamp"] = json!(0);
+        let token = get_shard_iterator(&store, &req).unwrap()["ShardIterator"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (_, count, _) = get_records(&store, &json!({ "ShardIterator": token })).unwrap();
+        assert_eq!(count, 1, "timestamp 0 starts at the first stored record");
+    }
+
+    #[test]
+    fn at_timestamp_iterator_after_all_records_reads_nothing() {
+        let mut store = store_with_stream();
+        store.put("S", "pk".into(), vec![1], None);
+        let mut req = iterator_req("shardId-000000000000", "AT_TIMESTAMP");
+        req["Timestamp"] = json!(4_102_444_800u64); // 2100-01-01, after any test record
+        let token = get_shard_iterator(&store, &req).unwrap()["ShardIterator"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (_, count, _) = get_records(&store, &json!({ "ShardIterator": token })).unwrap();
+        assert_eq!(count, 0, "a timestamp past every record starts at the tail");
     }
 
     #[test]
