@@ -853,6 +853,71 @@ mod tests {
         assert_eq!(out["StreamDescription"]["StreamName"], "S");
     }
 
+    // ---- ARN acceptance on data-plane ops + DeleteStream ------------------------
+
+    #[test]
+    fn delete_stream_rejects_unknown_stream() {
+        let mut store = Store::new(86_400);
+        assert_eq!(
+            delete_stream(&mut store, &json!({ "StreamName": "MISSING" }))
+                .unwrap_err()
+                .kind,
+            "ResourceNotFoundException"
+        );
+    }
+
+    #[test]
+    fn delete_stream_accepts_stream_arn() {
+        let mut store = store_with_stream();
+        let arn = store.streams["S"].arn.clone();
+        delete_stream(&mut store, &json!({ "StreamARN": arn })).unwrap();
+        assert!(store.streams.is_empty());
+    }
+
+    #[test]
+    fn put_record_accepts_stream_arn() {
+        let mut store = store_with_stream();
+        let arn = store.streams["S"].arn.clone();
+        let req = json!({ "StreamARN": arn, "PartitionKey": "p", "Data": encode_data(&[1]) });
+        assert!(put_record(&mut store, None, &req).is_ok());
+    }
+
+    #[test]
+    fn put_records_accepts_stream_arn() {
+        let mut store = store_with_stream();
+        let arn = store.streams["S"].arn.clone();
+        let req = json!({ "StreamARN": arn, "Records": [
+            { "PartitionKey": "p", "Data": encode_data(&[1]) }
+        ]});
+        let out = put_records(&mut store, None, &req).unwrap();
+        assert_eq!(out["FailedRecordCount"], 0);
+    }
+
+    #[test]
+    fn get_shard_iterator_accepts_stream_arn() {
+        let store = store_with_stream();
+        let arn = store.streams["S"].arn.clone();
+        let req = json!({
+            "StreamARN": arn,
+            "ShardId": "shardId-000000000000",
+            "ShardIteratorType": "TRIM_HORIZON",
+        });
+        assert!(get_shard_iterator(&store, &req).is_ok());
+    }
+
+    #[test]
+    fn create_stream_retention_zero_means_keep_forever() {
+        let mut store = Store::new(86_400);
+        create_stream(
+            &mut store,
+            &json!({ "StreamName": "S", "RetentionPeriodHours": 0 }),
+        )
+        .unwrap();
+        // 0 disables trimming (see Store::trim_expired); the API must pass it
+        // through rather than falling back to the store default.
+        assert_eq!(store.streams["S"].retention_secs, 0);
+    }
+
     // ---- CreateStream name validation ------------------------------------------
 
     fn create(name: &str) -> Result<Value, ApiError> {
