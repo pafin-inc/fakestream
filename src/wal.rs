@@ -124,7 +124,14 @@ impl Wal {
             let is_last = idx + 1 == ids.len();
             if good_off < bytes.len() {
                 if is_last {
-                    // Crash-torn trailing frame: truncate so future appends stay clean.
+                    // Crash-torn trailing frame: truncate so future appends stay
+                    // clean. Log the discarded bytes — truncation can drop more
+                    // than one frame, and silent loss hides a real crash.
+                    tracing::warn!(
+                        segment = %path.display(),
+                        truncated_bytes = bytes.len() - good_off,
+                        "WAL active segment truncated at last good frame"
+                    );
                     OpenOptions::new()
                         .write(true)
                         .open(&path)?
