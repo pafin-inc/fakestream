@@ -90,6 +90,20 @@ aws $EP kinesis get-records --shard-iterator "$IT"
 Errors: `ResourceNotFoundException`, `ResourceInUseException`, `ExpiredIteratorException`
 (5-minute iterator TTL), `ValidationException`, `InvalidArgumentException`, `InternalFailure`.
 
+## Security & scope
+
+fakestream is a local development and CI emulator with no authentication. Run it on a
+trusted network (localhost, a CI job, a private container network) — do not expose it to
+untrusted clients.
+
+Request bodies are capped at 16 MiB, which bounds the working set for a normal request. One
+residual remains: the underlying HTTP library (`tiny_http`) reads and discards the tail of an
+oversized request on drop, sizing that discard buffer from the client-declared `Content-Length`.
+A client that declares a very large `Content-Length`, sends a little, then disconnects can force
+a single large (lazily-zeroed) allocation whose effect depends on the OS overcommit policy — up
+to aborting the process under strict overcommit. Closing it needs a change to `tiny_http`'s drain
+behavior; on a trusted network it isn't reachable, so it's left as documented.
+
 ## Docker
 
 Pull the prebuilt multi-arch image (`linux/amd64`, `linux/arm64`) from GHCR:
