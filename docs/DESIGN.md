@@ -85,6 +85,9 @@ maintenance tick.
 Smaller values mean more segments and more frequent drop-eligible boundaries; larger values reduce
 file-open overhead.
 
+See `WAL.md` for the WAL's crash-consistency contract — the durability invariants, the poisoned-segment
+mechanism, per-stream retention GC, and the manifest/lock ordering that maintenance relies on.
+
 Why this is enough for "keep unconsumed records": the consumers don't rely on server-side
 consumption state — they checkpoint in DynamoDB and resume with `AFTER_SEQUENCE_NUMBER`. So as long
 as records and the sequence counter survive the restart, already-consumed records are skipped (the
