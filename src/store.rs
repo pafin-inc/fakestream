@@ -25,7 +25,7 @@ pub struct Record {
 }
 
 /// One shard: a contiguous slice of the 128-bit partition-key hash space.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct Shard {
     pub id: String,
     pub hash_start: u128,
@@ -35,7 +35,7 @@ pub struct Shard {
 }
 
 /// A stream and its shards.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct Stream {
     pub name: String,
     pub arn: String,

@@ -336,22 +336,8 @@ fn route(
     }
 
     let result = match op {
-        "CreateStream" => {
-            let mut s = write(store);
-            let result = ops::create_stream(&mut s, &req);
-            if result.is_ok() {
-                save_manifest(persist_dir, &s);
-            }
-            result
-        }
-        "DeleteStream" => {
-            let mut s = write(store);
-            let result = ops::delete_stream(&mut s, &req);
-            if result.is_ok() {
-                save_manifest(persist_dir, &s);
-            }
-            result
-        }
+        "CreateStream" => create_stream_durably(&mut write(store), persist_dir, &req),
+        "DeleteStream" => delete_stream_durably(&mut write(store), persist_dir, &req),
         "PutRecord" => with_wal(store, wal, |s, w| ops::put_record(s, w, &req)),
         "PutRecords" => with_wal(store, wal, |s, w| ops::put_records(s, w, &req)),
         "ListStreams" => ops::list_streams(&read(store), &req),
@@ -428,13 +414,51 @@ fn with_wal(
     }
 }
 
-/// Rewrite the stream-definition manifest when persistence is on.
-fn save_manifest(persist_dir: &Option<String>, store: &Store) {
-    if let Some(dir) = persist_dir {
-        if let Err(err) = manifest::save(std::path::Path::new(dir), store) {
-            tracing::error!(error = %err, "manifest save failed");
+/// Create a stream and make its definition durable before acking. If the
+/// manifest save fails, roll the create back so a crash can't lose the
+/// definition (and the WAL records later written to it) after the client was
+/// told the stream exists.
+fn create_stream_durably(
+    store: &mut Store,
+    persist_dir: &Option<String>,
+    req: &Value,
+) -> Result<Value, ApiError> {
+    let result = ops::create_stream(store, req)?;
+    if let Err(err) = save_manifest(persist_dir, store) {
+        if let Some(name) = req.get("StreamName").and_then(Value::as_str) {
+            store.streams.remove(name);
         }
+        return Err(err);
     }
+    Ok(result)
+}
+
+/// Delete a stream and make the removal durable before acking. If the manifest
+/// save fails, restore the stream so a crash can't resurrect a stream the client
+/// was told had been deleted.
+fn delete_stream_durably(
+    store: &mut Store,
+    persist_dir: &Option<String>,
+    req: &Value,
+) -> Result<Value, ApiError> {
+    let removed = ops::delete_stream(store, req)?;
+    if let Err(err) = save_manifest(persist_dir, store) {
+        store.streams.insert(removed.name.clone(), removed);
+        return Err(err);
+    }
+    Ok(serde_json::json!({}))
+}
+
+/// Rewrite the stream-definition manifest when persistence is on. A save failure
+/// is surfaced as `InternalFailure` so callers never ack a non-durable change.
+fn save_manifest(persist_dir: &Option<String>, store: &Store) -> Result<(), ApiError> {
+    let Some(dir) = persist_dir else {
+        return Ok(());
+    };
+    manifest::save(std::path::Path::new(dir), store).map_err(|err| {
+        tracing::error!(error = %err, "manifest save failed");
+        ApiError::internal("Stream definition could not be durably persisted")
+    })
 }
 
 fn write(store: &RwLock<Store>) -> RwLockWriteGuard<'_, Store> {
@@ -563,6 +587,62 @@ mod tests {
         persist_and_gc(&store, &wal, &dir, 10_000_000);
         assert!(dir.join("manifest.json").exists());
         assert_eq!(wal_files(), 1, "only the active segment remains");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_rolls_back_when_manifest_save_fails() {
+        let dir = std::env::temp_dir().join(format!(
+            "fakestream-test-create-rollback-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // Occupy the temp path with a directory so the manifest save fails.
+        fs::create_dir(dir.join("manifest.json.tmp")).unwrap();
+
+        let mut store = Store::new(86_400);
+        let persist = Some(dir.to_string_lossy().into_owned());
+        let err =
+            create_stream_durably(&mut store, &persist, &json!({ "StreamName": "S" })).unwrap_err();
+
+        assert_eq!(err.kind, "InternalFailure");
+        assert_eq!(err.status, 500);
+        assert!(
+            !store.streams.contains_key("S"),
+            "a create whose manifest didn't persist must not stay in memory"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_rolls_back_when_manifest_save_fails() {
+        let dir = std::env::temp_dir().join(format!(
+            "fakestream-test-delete-rollback-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut store = Store::new(86_400);
+        store.create_stream("S", 1, None);
+        store.put("S", "p".into(), vec![1, 2, 3], None);
+        let persist = Some(dir.to_string_lossy().into_owned());
+        // Block the save only for the delete.
+        fs::create_dir(dir.join("manifest.json.tmp")).unwrap();
+        let err =
+            delete_stream_durably(&mut store, &persist, &json!({ "StreamName": "S" })).unwrap_err();
+
+        assert_eq!(err.kind, "InternalFailure");
+        assert!(
+            store.streams.contains_key("S"),
+            "a delete whose manifest didn't persist must leave the stream in place"
+        );
+        assert_eq!(
+            store.last_record("S", "shardId-000000000000").unwrap().seq,
+            1,
+            "the restored stream must keep its records"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

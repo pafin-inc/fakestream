@@ -224,12 +224,14 @@ pub fn create_stream(store: &mut Store, req: &Value) -> Result<Value, ApiError> 
     Ok(json!({}))
 }
 
-pub fn delete_stream(store: &mut Store, req: &Value) -> Result<Value, ApiError> {
+/// Remove a stream, returning its definition so the caller can restore it if the
+/// manifest can't be made durable.
+pub fn delete_stream(store: &mut Store, req: &Value) -> Result<Stream, ApiError> {
     let name = resolve_stream_name(req)?;
-    if store.streams.remove(name).is_none() {
-        return Err(ApiError::not_found(format!("Stream {name} not found")));
-    }
-    Ok(json!({}))
+    store
+        .streams
+        .remove(name)
+        .ok_or_else(|| ApiError::not_found(format!("Stream {name} not found")))
 }
 
 pub fn put_record(
