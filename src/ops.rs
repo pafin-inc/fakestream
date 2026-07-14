@@ -305,6 +305,12 @@ pub fn put_records(
         .get("Records")
         .and_then(Value::as_array)
         .ok_or_else(|| ApiError::validation("Missing required parameter: Records"))?;
+    if records.is_empty() {
+        return Err(ApiError::validation(
+            "1 validation error detected: Value at 'records' failed to satisfy constraint: \
+             Member must have length greater than or equal to 1",
+        ));
+    }
     if records.len() > MAX_PUT_RECORDS_COUNT {
         return Err(ApiError::validation(format!(
             "1 validation error detected: Value at 'records' failed to satisfy constraint: \
@@ -712,6 +718,16 @@ mod tests {
         let req = records_req(vec![(4, 1000); 10]);
         let out = put_records(&mut store, None, &req).unwrap();
         assert_eq!(out["FailedRecordCount"], 0);
+    }
+
+    #[test]
+    fn put_records_rejects_empty_batch() {
+        let mut store = store_with_stream();
+        let req = json!({ "StreamName": "S", "Records": [] });
+        assert_eq!(
+            put_records(&mut store, None, &req).unwrap_err().kind,
+            "ValidationException"
+        );
     }
 
     #[test]
