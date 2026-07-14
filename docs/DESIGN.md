@@ -51,7 +51,8 @@ ops.rs         one handler per operation; request parsing + JSON response shapin
 ```
 
 Dependencies (intentionally few): `tiny_http` (blocking HTTP, no tokio), `serde`/`serde_json`,
-`postcard`, `base64`, `md-5`. Release profile is size-optimized (`opt-level="z"`, LTO, `panic="abort"`, stripped).
+`postcard`, `base64`, `md-5`, `tracing`/`tracing-subscriber` (application logging). Release profile
+is size-optimized (`opt-level="z"`, LTO, `panic="abort"`, stripped).
 
 ## Persistence & retention
 
