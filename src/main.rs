@@ -14,7 +14,7 @@ mod protocol;
 mod store;
 mod wal;
 
-use std::io::Read;
+use std::io::{self, Read};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread;
 use std::time::Duration;
@@ -275,6 +275,14 @@ fn handle(
         return;
     }
     if let Err(err) = check_body_size(body.len() as u64) {
+        // We buffered at most the cap. Dropping the request now would make
+        // tiny_http's EqualReader drain the unread declared Content-Length in a
+        // single `vec![0; remaining]` allocation (util/equal_reader.rs). Drain it
+        // here in bounded chunks so a genuinely oversized upload can't force that
+        // one large allocation. (A client that lies about Content-Length and then
+        // closes still leaves EqualReader one over-declared, lazily-zeroed alloc
+        // we can't avoid without patching the dependency.)
+        let _ = io::copy(&mut request.as_reader(), &mut io::sink());
         respond_error(request, &err);
         return;
     }
