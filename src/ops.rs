@@ -18,6 +18,7 @@ const MAX_RECORD_BYTES: usize = 1_048_576; // 1 MiB, Kinesis data-blob limit (de
 const MAX_PUT_RECORDS_COUNT: usize = 500;
 const MAX_SHARD_COUNT: u64 = 10_000; // local sanity cap; also blocks the old `as u32` truncation
 const MAX_PUT_RECORDS_AGGREGATE_BYTES: usize = 5 * 1_048_576; // 5 MiB, data + partition keys
+const MAX_PARTITION_KEY_CHARS: usize = 256; // Kinesis PartitionKey length limit (1..=256)
 
 fn require_str<'a>(req: &'a Value, key: &str) -> Result<&'a str, ApiError> {
     req.get(key)
@@ -177,6 +178,18 @@ fn validate_stream_name(name: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Kinesis requires a PartitionKey of 1..=256 Unicode characters. Measured in
+/// `chars`, matching how Kinesis counts the key's length rather than its bytes.
+fn validate_partition_key(key: &str) -> Result<(), ApiError> {
+    if (1..=MAX_PARTITION_KEY_CHARS).contains(&key.chars().count()) {
+        return Ok(());
+    }
+    Err(ApiError::validation(
+        "1 validation error detected: Value at 'partitionKey' failed to satisfy \
+         constraint: Member must have length between 1 and 256",
+    ))
+}
+
 pub fn create_stream(store: &mut Store, req: &Value) -> Result<Value, ApiError> {
     let name = require_str(req, "StreamName")?;
     validate_stream_name(name)?;
@@ -226,6 +239,7 @@ pub fn put_record(
 ) -> Result<Value, ApiError> {
     let name = resolve_stream_name(req)?;
     let partition_key = require_str(req, "PartitionKey")?.to_string();
+    validate_partition_key(&partition_key)?;
     let data = decode_data(require_str(req, "Data")?)?;
     if data.len() > MAX_RECORD_BYTES {
         return Err(ApiError::validation(
@@ -303,6 +317,7 @@ pub fn put_records(
     let mut aggregate = 0usize;
     for (i, record) in records.iter().enumerate() {
         let partition_key = require_str(record, "PartitionKey")?.to_string();
+        validate_partition_key(&partition_key)?;
         let data = decode_data(require_str(record, "Data")?)?;
         if data.len() > MAX_RECORD_BYTES {
             return Err(ApiError::validation(format!(
@@ -697,6 +712,51 @@ mod tests {
         let req = records_req(vec![(4, 1000); 10]);
         let out = put_records(&mut store, None, &req).unwrap();
         assert_eq!(out["FailedRecordCount"], 0);
+    }
+
+    #[test]
+    fn put_record_rejects_empty_partition_key() {
+        let mut store = store_with_stream();
+        let req = json!({ "StreamName": "S", "PartitionKey": "", "Data": encode_data(&[1]) });
+        assert_eq!(
+            put_record(&mut store, None, &req).unwrap_err().kind,
+            "ValidationException"
+        );
+    }
+
+    #[test]
+    fn put_record_rejects_oversized_partition_key() {
+        let mut store = store_with_stream();
+        let pk = "x".repeat(MAX_PARTITION_KEY_CHARS + 1);
+        let req = json!({ "StreamName": "S", "PartitionKey": pk, "Data": encode_data(&[1]) });
+        assert_eq!(
+            put_record(&mut store, None, &req).unwrap_err().kind,
+            "ValidationException"
+        );
+    }
+
+    #[test]
+    fn put_record_accepts_max_length_partition_key() {
+        let mut store = store_with_stream();
+        let pk = "x".repeat(MAX_PARTITION_KEY_CHARS);
+        let req = json!({ "StreamName": "S", "PartitionKey": pk, "Data": encode_data(&[1]) });
+        assert!(put_record(&mut store, None, &req).is_ok());
+    }
+
+    #[test]
+    fn put_records_rejects_bad_partition_key_without_storing() {
+        let mut store = store_with_stream();
+        let req = json!({ "StreamName": "S", "Records": [
+            { "PartitionKey": "", "Data": encode_data(&[1]) }
+        ]});
+        assert_eq!(
+            put_records(&mut store, None, &req).unwrap_err().kind,
+            "ValidationException"
+        );
+        assert_eq!(
+            store.stream_sizes().iter().map(|(_, n, _)| n).sum::<u64>(),
+            0
+        );
     }
 
     #[test]
