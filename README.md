@@ -88,7 +88,7 @@ aws $EP kinesis get-records --shard-iterator "$IT"
 `AT_TIMESTAMP`), `PutRecord`, `PutRecords`, `GetRecords`.
 
 Errors: `ResourceNotFoundException`, `ResourceInUseException`, `ExpiredIteratorException`
-(5-minute iterator TTL), `ValidationException`.
+(5-minute iterator TTL), `ValidationException`, `InvalidArgumentException`, `InternalFailure`.
 
 ## Docker
 
