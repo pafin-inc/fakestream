@@ -262,19 +262,21 @@ fn handle(
         .find(|h| h.field.equiv("X-Amz-Target"))
         .map(|h| h.value.as_str().to_string());
 
-    let mut body = String::new();
+    let mut raw = Vec::new();
     // Read one byte past the cap with `take`: an oversized body is detected
     // after buffering at most one byte over the limit, without draining an
-    // arbitrarily large request.
+    // arbitrarily large request. Read raw bytes and size-check them before
+    // decoding UTF-8, so an oversized body is classified as a size error even
+    // when the cap cuts mid-way through a multibyte character.
     let mut reader = request.as_reader().take(MAX_REQUEST_BODY_BYTES + 1);
-    if reader.read_to_string(&mut body).is_err() {
+    if reader.read_to_end(&mut raw).is_err() {
         respond_error(
             request,
             &ApiError::new("SerializationException", "Unreadable request body"),
         );
         return;
     }
-    if let Err(err) = check_body_size(body.len() as u64) {
+    if let Err(err) = check_body_size(raw.len() as u64) {
         // We buffered at most the cap. Dropping the request now would make
         // tiny_http's EqualReader drain the unread declared Content-Length in a
         // single `vec![0; remaining]` allocation (util/equal_reader.rs). Drain it
@@ -286,6 +288,13 @@ fn handle(
         respond_error(request, &err);
         return;
     }
+    let Ok(body) = String::from_utf8(raw) else {
+        respond_error(
+            request,
+            &ApiError::new("SerializationException", "Unreadable request body"),
+        );
+        return;
+    };
 
     match route(target.as_deref(), &body, store, wal, persist_dir, metrics) {
         Ok(OpResponse::Json(json)) => respond_ok_json(request, &json),
