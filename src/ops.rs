@@ -467,23 +467,34 @@ pub fn get_shard_iterator(store: &Store, req: &Value) -> Result<Value, ApiError>
     let name = resolve_stream_name(req)?;
     let shard_id = require_str(req, "ShardId")?;
     let iterator_type = require_str(req, "ShardIteratorType")?;
-    let starting =
-        match req.get("StartingSequenceNumber").and_then(Value::as_str) {
-            Some(text) => Some(text.parse::<u64>().map_err(|_| {
+    // A present-but-mistyped field is a type error, not a missing one, matching
+    // how StreamName/StreamARN reject non-strings. Treat JSON null as absent.
+    let starting = match req.get("StartingSequenceNumber") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let text = value
+                .as_str()
+                .ok_or_else(|| ApiError::validation("StartingSequenceNumber must be a string"))?;
+            Some(text.parse::<u64>().map_err(|_| {
                 ApiError::new("ValidationException", "Invalid StartingSequenceNumber")
-            })?),
-            None => None,
-        };
-    let timestamp_ms = match req.get("Timestamp").and_then(Value::as_f64) {
-        None => None,
-        Some(secs) if secs < 0.0 => {
-            return Err(ApiError::validation(format!(
-                "Timestamp must not be before the Unix epoch: {secs}"
-            )));
+            })?)
         }
-        // The cast is exact for any realistic epoch value and secs is
-        // non-negative here, so it cannot saturate to a misleading 0.
-        Some(secs) => Some((secs * 1000.0) as u128),
+    };
+    let timestamp_ms = match req.get("Timestamp") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let secs = value
+                .as_f64()
+                .ok_or_else(|| ApiError::validation("Timestamp must be a number"))?;
+            if secs < 0.0 {
+                return Err(ApiError::validation(format!(
+                    "Timestamp must not be before the Unix epoch: {secs}"
+                )));
+            }
+            // The cast is exact for any realistic epoch value and secs is
+            // non-negative here, so it cannot saturate to a misleading 0.
+            Some((secs * 1000.0) as u128)
+        }
     };
     // Classify argument errors before touching the store so a bad iterator type
     // or a missing StartingSequenceNumber doesn't masquerade as a deleted shard.
@@ -1116,6 +1127,28 @@ mod tests {
         assert_eq!(
             get_shard_iterator(&store, &req).unwrap_err().kind,
             "ResourceNotFoundException"
+        );
+    }
+
+    #[test]
+    fn get_shard_iterator_rejects_non_numeric_timestamp() {
+        let store = store_with_stream();
+        let mut req = iterator_req("shardId-000000000000", "AT_TIMESTAMP");
+        req["Timestamp"] = json!("soon");
+        assert_eq!(
+            get_shard_iterator(&store, &req).unwrap_err().kind,
+            "ValidationException"
+        );
+    }
+
+    #[test]
+    fn get_shard_iterator_rejects_non_string_sequence_number() {
+        let store = store_with_stream();
+        let mut req = iterator_req("shardId-000000000000", "AT_SEQUENCE_NUMBER");
+        req["StartingSequenceNumber"] = json!(1);
+        assert_eq!(
+            get_shard_iterator(&store, &req).unwrap_err().kind,
+            "ValidationException"
         );
     }
 
