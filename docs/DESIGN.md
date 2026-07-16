@@ -28,7 +28,8 @@ Kinesis is a single endpoint: `POST /` with
 - `Content-Type: application/x-amz-json-1.1`
 - JSON body; record payloads (`Data`) are **base64** in JSON.
 
-Success → HTTP 200 + JSON. Error → HTTP 400 + `{"__type":"<Exception>","message":"…"}` and an
+Success → HTTP 200 + JSON. Error → HTTP 400 (500 for `InternalFailure`) +
+`{"__type":"<Exception>","message":"…"}` and an
 `x-amzn-errortype` header. Both `boto3` and `aws-sdk-js v3` read `__type` to build the typed error
 (this is why `ExpiredIteratorException` correctly triggers the consumer's iterator-restart path).
 
@@ -45,12 +46,13 @@ main.rs        config (flags/env), HTTP loop, op routing, maintenance thread, re
 protocol.rs    X-Amz-Target parsing, ApiError → AWS JSON error body, base64 helpers
 store.rs       Store/Stream/Shard/Record, MD5 hash-key routing, sequence counter, iterators, trim
 manifest.rs    atomic JSON manifest save + load-on-startup (stream defs + seq high-water)
-wal.rs         segmented append-only WAL: length-framed bincode records, segment roll + drop
+wal.rs         segmented append-only WAL: length-framed postcard records, segment roll + drop
 ops.rs         one handler per operation; request parsing + JSON response shaping
 ```
 
 Dependencies (intentionally few): `tiny_http` (blocking HTTP, no tokio), `serde`/`serde_json`,
-`base64`, `md-5`. Release profile is size-optimized (`opt-level="z"`, LTO, `panic="abort"`, stripped).
+`postcard`, `base64`, `md-5`, `tracing`/`tracing-subscriber` (application logging). Release profile
+is size-optimized (`opt-level="z"`, LTO, `panic="abort"`, stripped).
 
 ## Persistence & retention
 
@@ -65,22 +67,27 @@ Two files make up the persistent state:
   (write to `<dir>/manifest.json.tmp`, then rename) whenever a stream is created or deleted, and on
   each maintenance tick. Records are **not** stored here; a pure-manifest restart with no WAL
   recovers stream definitions only.
-- **`<dir>/wal/seg-NNNNNNNNNN.log`** — length-framed bincode records (8-byte LE length prefix +
-  bincode body) in an append-only segmented file. Each new `PutRecord`/`PutRecords` call appends
+- **`<dir>/wal/seg-NNNNNNNNNN.log`** — length-framed postcard records (8-byte LE length prefix +
+  postcard body) in an append-only segmented file. Each new `PutRecord`/`PutRecords` call appends
   frames to the active segment. When the active segment reaches `--segment-bytes` (default 64 MiB),
   a new segment is opened. On replay, a crash-torn trailing frame (length prefix present but body
   truncated) is detected and the file is truncated to the last good byte so future appends stay
   clean.
 
 The maintenance thread runs every `--persist-interval` seconds (default 5). It trims expired
-records in memory, saves the manifest (preserving the current seq high-water), then drops any
-closed WAL segments whose newest record is older than the stream's retention. Segment drops happen
-**after** the manifest save, so a crash can't lose the seq high-water. The only loss window is
-records appended since the last maintenance tick.
+records in memory and saves the manifest, preserving the current seq high-water. A closed segment
+is dropped only when every stream represented in it is safe: the stream was deleted, or its newest
+record in that segment is older than that stream's finite retention. Retention `0` pins every
+segment containing that stream. Segment drops happen only after a successful manifest save, so a
+crash can't lose the seq high-water. The only loss window is records appended since the last
+maintenance tick.
 
 `--segment-bytes` / `FAKESTREAM_SEGMENT_BYTES` controls the segment roll size (default 64 MiB).
 Smaller values mean more segments and more frequent drop-eligible boundaries; larger values reduce
 file-open overhead.
+
+See `WAL.md` for the WAL's crash-consistency contract — the durability invariants, the poisoned-segment
+mechanism, per-stream retention GC, and the manifest/lock ordering that maintenance relies on.
 
 Why this is enough for "keep unconsumed records": the consumers don't rely on server-side
 consumption state — they checkpoint in DynamoDB and resume with `AFTER_SEQUENCE_NUMBER`. So as long

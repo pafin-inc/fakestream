@@ -25,24 +25,29 @@ pub struct Record {
 }
 
 /// One shard: a contiguous slice of the 128-bit partition-key hash space.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct Shard {
     pub id: String,
     pub hash_start: u128,
     pub hash_end: u128,
     #[serde(skip)]
     pub records: Vec<Record>,
-    pub closed: bool,
 }
 
 /// A stream and its shards.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct Stream {
     pub name: String,
     pub arn: String,
     pub shards: Vec<Shard>,
     pub retention_secs: u64,
     pub created_ms: u128,
+    /// Global seq counter value when this stream was created. WAL records with
+    /// a seq at or below it belong to an earlier incarnation of the name and
+    /// must not replay into this one. Defaults to 0 (replay everything) so
+    /// manifests written before this field existed keep their old behavior.
+    #[serde(default)]
+    pub created_seq_floor: u64,
 }
 
 /// Top-level state: all streams, the global sequence counter, and the default
@@ -66,8 +71,7 @@ pub struct Iterator {
 pub fn now_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_millis())
 }
 
 /// Hash a partition key into the 128-bit ring the way Kinesis does (MD5, big-endian).
@@ -107,24 +111,23 @@ impl Store {
             return false;
         }
         let count = shard_count.max(1);
-        let step = u128::MAX / count as u128;
+        let step = u128::MAX / u128::from(count);
         let mut shards = Vec::with_capacity(count as usize);
         for i in 0..count {
-            let hash_start = i as u128 * step;
+            let hash_start = u128::from(i) * step;
             let hash_end = if i == count - 1 {
                 u128::MAX
             } else {
-                (i as u128 + 1) * step - 1
+                (u128::from(i) + 1) * step - 1
             };
             shards.push(Shard {
                 id: shard_id(i),
                 hash_start,
                 hash_end,
                 records: Vec::new(),
-                closed: false,
             });
         }
-        let arn = format!("arn:aws:kinesis:local:000000000000:stream/{name}");
+        let arn = format!("arn:aws:kinesis:us-east-1:000000000000:stream/{name}");
         let retention_secs = retention_secs.unwrap_or(self.default_retention_secs);
         self.streams.insert(
             name.to_string(),
@@ -134,6 +137,7 @@ impl Store {
                 shards,
                 retention_secs,
                 created_ms: now_ms(),
+                created_seq_floor: self.seq_counter,
             },
         );
         true
@@ -147,7 +151,7 @@ impl Store {
             if stream.retention_secs == 0 {
                 continue;
             }
-            let cutoff_ms = (stream.retention_secs as u128) * 1000;
+            let cutoff_ms = u128::from(stream.retention_secs) * 1000;
             for shard in &mut stream.shards {
                 let before = shard.records.len();
                 shard
@@ -174,7 +178,7 @@ impl Store {
         let shard = stream
             .shards
             .iter_mut()
-            .find(|s| !s.closed && hash >= s.hash_start && hash <= s.hash_end)?;
+            .find(|s| hash >= s.hash_start && hash <= s.hash_end)?;
         let shard_id = shard.id.clone();
         shard.records.push(Record {
             seq,
@@ -183,6 +187,20 @@ impl Store {
             timestamp_ms: now,
         });
         Some((shard_id, seq))
+    }
+
+    /// Undo the most recent `put` on a shard when its WAL append fails, so a
+    /// record we couldn't durably write is never acked to the client. Only pops
+    /// when the tail record still carries `seq` (the one we just assigned). The
+    /// seq counter is deliberately left advanced: burning the number keeps the
+    /// high-water monotonic so a later record can't reuse it.
+    pub fn pop_record(&mut self, stream: &str, shard_id: &str, seq: u64) -> Option<Record> {
+        let stream = self.streams.get_mut(stream)?;
+        let shard = stream.shards.iter_mut().find(|s| s.id == shard_id)?;
+        if shard.records.last().map(|r| r.seq) != Some(seq) {
+            return None;
+        }
+        shard.records.pop()
     }
 
     /// (stream name, record count, total payload bytes) for every stream.
@@ -237,6 +255,15 @@ impl Store {
         let Some(stream) = self.streams.get_mut(stream) else {
             return false;
         };
+        // Drop records from an earlier incarnation of this stream name. Shard
+        // IDs are deterministic, so a delete-then-recreate reuses them and the
+        // deleted stream's WAL records would otherwise resurrect on replay.
+        // Wall time can't tell incarnations apart (delete + recreate can land
+        // in one millisecond); the global seq counter can — every seq assigned
+        // before this stream existed is at or below its creation-time floor.
+        if record.seq <= stream.created_seq_floor {
+            return false;
+        }
         let Some(shard) = stream.shards.iter_mut().find(|s| s.id == shard_id) else {
             return false;
         };
@@ -263,16 +290,13 @@ impl Store {
             .last()
     }
 
-    /// Largest retention across all current streams (0 = keep-forever wins).
-    pub fn max_retention_secs(&self) -> u64 {
-        if self.streams.values().any(|s| s.retention_secs == 0) {
-            return 0;
-        }
+    /// Per-stream retention (seconds) for every current stream, used by the WAL
+    /// GC to decide segment drops per stream rather than by a single global value.
+    pub fn stream_retentions(&self) -> HashMap<String, u64> {
         self.streams
-            .values()
-            .map(|s| s.retention_secs)
-            .max()
-            .unwrap_or(self.default_retention_secs)
+            .iter()
+            .map(|(name, stream)| (name.clone(), stream.retention_secs))
+            .collect()
     }
 }
 
@@ -283,7 +307,7 @@ fn resolve_start(
     starting_seq: Option<u64>,
     timestamp_ms: Option<u128>,
 ) -> Option<u64> {
-    let latest = shard.records.last().map(|r| r.seq).unwrap_or(0);
+    let latest = shard.records.last().map_or(0, |r| r.seq);
     match iterator_type {
         "TRIM_HORIZON" => Some(0),
         "LATEST" => Some(latest + 1),
@@ -327,6 +351,70 @@ mod tests {
     }
 
     #[test]
+    fn restore_record_rejects_earlier_incarnation_in_same_millisecond() {
+        let shard = "shardId-000000000000";
+        let mut s = Store::new(86_400);
+        s.create_stream("S", 1, None);
+        // First incarnation assigns seqs 1..=3 through the global counter.
+        for _ in 0..3 {
+            s.put("S", "p".into(), vec![1], None).unwrap();
+        }
+        s.streams.remove("S");
+        s.create_stream("S", 1, None); // floor = 3
+        let created_ms = s.streams["S"].created_ms;
+        // The old incarnation's last record carries the exact created_ms of the
+        // recreated stream — wall time cannot tell the incarnations apart.
+        let old = Record {
+            seq: 3,
+            partition_key: "old".into(),
+            data: vec![1],
+            timestamp_ms: created_ms,
+        };
+        assert!(!s.restore_record("S", shard, old));
+        // The new incarnation's first record, in that same millisecond, replays.
+        let new = Record {
+            seq: 4,
+            partition_key: "new".into(),
+            data: vec![1],
+            timestamp_ms: created_ms,
+        };
+        assert!(s.restore_record("S", shard, new));
+        assert_eq!(s.last_record("S", shard).unwrap().partition_key, "new");
+    }
+
+    #[test]
+    fn manifest_without_seq_floor_replays_everything() {
+        // Manifests written before created_seq_floor existed must still load,
+        // with the floor defaulting to 0 (their old replay-everything behavior).
+        let mut s = Store::new(86_400);
+        s.create_stream("S", 1, None);
+        // Strip the field textually: Value round-trips can't carry the u128
+        // shard hash bounds, so this edits the serialized form directly.
+        let json = serde_json::to_string(&s).unwrap();
+        let stripped = json.replace(",\"created_seq_floor\":0", "");
+        assert_ne!(json, stripped, "field should have been present and removed");
+        let mut back: Store = serde_json::from_str(&stripped).unwrap();
+        assert_eq!(back.streams["S"].created_seq_floor, 0);
+        assert!(back.restore_record("S", "shardId-000000000000", rec(1)));
+    }
+
+    #[test]
+    fn pop_record_removes_only_the_matching_tail() {
+        let mut s = Store::new(86_400);
+        s.create_stream("S", 1, None);
+        let (shard_id, seq) = s.put("S", "p".into(), vec![1], None).unwrap();
+        // A stale seq must not pop the tail.
+        assert!(s.pop_record("S", &shard_id, seq + 1).is_none());
+        assert!(s.last_record("S", &shard_id).is_some());
+        // The matching seq pops it.
+        assert_eq!(s.pop_record("S", &shard_id, seq).unwrap().seq, seq);
+        assert!(s.last_record("S", &shard_id).is_none());
+        // The seq counter stays advanced: the next put gets a fresh number.
+        let (_, next) = s.put("S", "p".into(), vec![2], None).unwrap();
+        assert_eq!(next, seq + 1);
+    }
+
+    #[test]
     fn manifest_serde_round_trip_drops_records() {
         let mut s = Store::new(86_400);
         s.create_stream("S", 1, None);
@@ -339,10 +427,13 @@ mod tests {
     }
 
     #[test]
-    fn max_retention_is_the_largest_stream() {
+    fn stream_retentions_reports_each_stream() {
         let mut s = Store::new(3600);
         s.create_stream("A", 1, Some(3600));
-        s.create_stream("B", 1, Some(86_400));
-        assert_eq!(s.max_retention_secs(), 86_400);
+        s.create_stream("B", 1, Some(0));
+        let retentions = s.stream_retentions();
+        assert_eq!(retentions.get("A"), Some(&3600));
+        assert_eq!(retentions.get("B"), Some(&0));
+        assert_eq!(retentions.len(), 2);
     }
 }

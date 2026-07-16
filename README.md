@@ -9,7 +9,8 @@ PutRecord + polling-consumer workflows. Kinesis only — nothing else.
 - Drop-in for a LocalStack-based local stack (replaces LocalStack's Kinesis;
   DynamoDB and friends stay exactly where they are).
 
-See `docs/RESEARCH.md` for the alternatives comparison and `docs/DESIGN.md` for the design.
+See `docs/RESEARCH.md` for the alternatives comparison, `docs/DESIGN.md` for the design, and
+`docs/WAL.md` for the write-ahead log's crash-consistency design.
 
 ## Build & run
 
@@ -42,7 +43,7 @@ in-memory (ideal for tests).
 The persistence layout inside `<dir>`:
 - `manifest.json` — stream definitions and the sequence counter high-water mark (atomically
   rewritten on stream create/delete and on each maintenance tick; records are **not** inlined).
-- `wal/seg-NNNNNNNNNN.log` — segmented append-only write-ahead log (length-framed bincode
+- `wal/seg-NNNNNNNNNN.log` — segmented append-only write-ahead log (length-framed postcard
   records). On startup, the manifest is loaded and then all WAL segments are replayed in order
   to recover records. A crash-torn trailing frame is detected and truncated so appends stay
   clean. Whole segments are dropped once every record in them is past retention.
@@ -87,7 +88,21 @@ aws $EP kinesis get-records --shard-iterator "$IT"
 `AT_TIMESTAMP`), `PutRecord`, `PutRecords`, `GetRecords`.
 
 Errors: `ResourceNotFoundException`, `ResourceInUseException`, `ExpiredIteratorException`
-(5-minute iterator TTL), `ValidationException`.
+(5-minute iterator TTL), `ValidationException`, `InvalidArgumentException`, `InternalFailure`.
+
+## Security & scope
+
+fakestream is a local development and CI emulator with no authentication. Run it on a
+trusted network (localhost, a CI job, a private container network) — do not expose it to
+untrusted clients.
+
+Request bodies are capped at 16 MiB, which bounds the working set for a normal request. One
+residual remains: the underlying HTTP library (`tiny_http`) reads and discards the tail of an
+oversized request on drop, sizing that discard buffer from the client-declared `Content-Length`.
+A client that declares a very large `Content-Length`, sends a little, then disconnects can force
+a single large (lazily-zeroed) allocation whose effect depends on the OS overcommit policy — up
+to aborting the process under strict overcommit. Closing it needs a change to `tiny_http`'s drain
+behavior; on a trusted network it isn't reachable, so it's left as documented.
 
 ## Docker
 
@@ -150,6 +165,12 @@ Override only the **Kinesis** endpoint, leaving DynamoDB and other services unto
 - **Python producer (`boto3`)**: set `AWS_ENDPOINT_URL_KINESIS=http://localhost:4567` (service-specific).
 - **JS consumer (`aws-sdk-js v3`)**: set the Kinesis client `endpoint` to `http://localhost:4567`;
   leave the DynamoDB endpoint where it is.
+Java SDK clients default to CBOR (`application/x-amz-cbor-1.1`), which fakestream does not
+speak. Configure the SDK to send JSON:
+
+- **Java (`aws-sdk-java v1`)**: set `AWS_CBOR_DISABLED=true` or
+  `-Dcom.amazonaws.sdk.disableCbor=true`.
+- **Java (`aws-sdk-java v2`)**: set `CBOR_ENABLED=false` or `-Daws.cborEnabled=false`.
 
 > Note: single-shard streams match the common single-shard consumer assumption. fakestream supports
 > `--shard-count N`, but a consumer that only reads the first `ListShards` page sees one shard.

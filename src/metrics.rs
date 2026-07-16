@@ -39,8 +39,7 @@ impl Metrics {
         }
         let start_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
         Metrics {
             put_records: AtomicU64::new(0),
             get_records: AtomicU64::new(0),
@@ -91,7 +90,7 @@ impl Metrics {
         ));
         out.push_str("# TYPE fakestream_requests_total counter\n");
         for op in OPS {
-            let value = self.requests.get(op).map(|c| c.load(Relaxed)).unwrap_or(0);
+            let value = self.requests.get(op).map_or(0, |c| c.load(Relaxed));
             out.push_str(&format!(
                 "fakestream_requests_total{{op=\"{op}\"}} {value}\n"
             ));

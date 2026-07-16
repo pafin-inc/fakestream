@@ -16,12 +16,85 @@ const MAX_GET_RECORDS_BYTES: usize = 10 * 1_048_576; // 10 MiB, Kinesis GetRecor
 const RECORD_JSON_OVERHEAD: usize = 144; // fixed keys + quotes + seq/timestamp digits + comma
 const MAX_RECORD_BYTES: usize = 1_048_576; // 1 MiB, Kinesis data-blob limit (decoded)
 const MAX_PUT_RECORDS_COUNT: usize = 500;
+const MAX_SHARD_COUNT: u64 = 10_000; // local sanity cap; also blocks the old `as u32` truncation
 const MAX_PUT_RECORDS_AGGREGATE_BYTES: usize = 5 * 1_048_576; // 5 MiB, data + partition keys
+const MAX_PARTITION_KEY_CHARS: usize = 256; // Kinesis PartitionKey length limit (1..=256)
 
 fn require_str<'a>(req: &'a Value, key: &str) -> Result<&'a str, ApiError> {
     req.get(key)
         .and_then(Value::as_str)
         .ok_or_else(|| ApiError::validation(format!("Missing required parameter: {key}")))
+}
+
+/// Validate a Kinesis stream ARN and extract its stream name.
+fn arn_stream_name(arn: &str) -> Option<&str> {
+    let mut fields = arn.splitn(6, ':');
+    let prefix = fields.next()?;
+    let partition = fields.next()?;
+    let service = fields.next()?;
+    let region = fields.next()?;
+    let account = fields.next()?;
+    let resource = fields.next()?;
+
+    if prefix != "arn"
+        || !(partition == "aws" || partition.starts_with("aws-"))
+        || service != "kinesis"
+        || region.is_empty()
+        || account.len() != 12
+        || !account.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+
+    let name = resource.strip_prefix("stream/")?;
+    if name.is_empty() || name.contains('/') || validate_stream_name(name).is_err() {
+        return None;
+    }
+    Some(name)
+}
+
+/// Resolve the target stream name from a data-plane request. Since the 2022
+/// Kinesis API update these ops accept `StreamARN` in place of `StreamName`;
+/// clients commonly feed back the ARN returned by DescribeStream/ListStreams.
+/// Prefer `StreamName`; when both are supplied they must agree, matching real
+/// Kinesis, rather than silently ignoring a mismatched ARN.
+fn resolve_stream_name(req: &Value) -> Result<&str, ApiError> {
+    let name = match req.get("StreamName") {
+        None => None,
+        Some(Value::String(name)) => Some(name.as_str()),
+        Some(_) => {
+            return Err(ApiError::validation(
+                "StreamName must be a string when provided",
+            ));
+        }
+    };
+    let arn = match req.get("StreamARN") {
+        None => None,
+        Some(Value::String(arn)) => Some(arn.as_str()),
+        Some(_) => {
+            return Err(ApiError::validation(
+                "StreamARN must be a string when provided",
+            ));
+        }
+    };
+    match (name, arn) {
+        (Some(name), Some(arn)) => {
+            let arn_name = arn_stream_name(arn)
+                .ok_or_else(|| ApiError::validation(format!("Invalid StreamARN: {arn}")))?;
+            if arn_name != name {
+                return Err(ApiError::validation(format!(
+                    "StreamARN {arn} does not match StreamName {name}"
+                )));
+            }
+            Ok(name)
+        }
+        (Some(name), None) => Ok(name),
+        (None, Some(arn)) => arn_stream_name(arn)
+            .ok_or_else(|| ApiError::validation(format!("Invalid StreamARN: {arn}"))),
+        (None, None) => Err(ApiError::validation(
+            "Missing required parameter: StreamName",
+        )),
+    }
 }
 
 fn parse_u128(text: &str, field: &str) -> Result<u128, ApiError> {
@@ -37,7 +110,7 @@ fn hash_key_range(shard: &Shard) -> Value {
 }
 
 fn shard_json(shard: &Shard) -> Value {
-    let starting = shard.records.first().map(|r| r.seq).unwrap_or(0);
+    let starting = shard.records.first().map_or(0, |r| r.seq);
     json!({
         "ShardId": shard.id,
         "HashKeyRange": hash_key_range(shard),
@@ -84,13 +157,64 @@ fn decode_iterator(token: &str) -> Result<Iterator, ApiError> {
 
 // ---- write operations -------------------------------------------------------
 
+/// Enforce the Kinesis stream-name constraint `[a-zA-Z0-9_.-]{1,128}`. Also
+/// guards the Prometheus exposition, where the name is interpolated into a label.
+fn validate_stream_name(name: &str) -> Result<(), ApiError> {
+    if name.is_empty() || name.len() > 128 {
+        return Err(ApiError::validation(format!(
+            "1 validation error detected: Value '{name}' at 'streamName' failed to satisfy \
+             constraint: Member must have length between 1 and 128"
+        )));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
+    {
+        return Err(ApiError::validation(format!(
+            "1 validation error detected: Value '{name}' at 'streamName' failed to satisfy \
+             constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
+        )));
+    }
+    Ok(())
+}
+
+/// Kinesis requires a PartitionKey of 1..=256 Unicode characters. Measured in
+/// `chars`, matching how Kinesis counts the key's length rather than its bytes.
+fn validate_partition_key(key: &str) -> Result<(), ApiError> {
+    if (1..=MAX_PARTITION_KEY_CHARS).contains(&key.chars().count()) {
+        return Ok(());
+    }
+    Err(ApiError::validation(
+        "1 validation error detected: Value at 'partitionKey' failed to satisfy \
+         constraint: Member must have length between 1 and 256",
+    ))
+}
+
 pub fn create_stream(store: &mut Store, req: &Value) -> Result<Value, ApiError> {
     let name = require_str(req, "StreamName")?;
-    let shard_count = req.get("ShardCount").and_then(Value::as_u64).unwrap_or(1) as u32;
-    let retention_secs = req
-        .get("RetentionPeriodHours")
-        .and_then(Value::as_u64)
-        .map(|h| h * 3600);
+    validate_stream_name(name)?;
+    let shard_count = match req.get("ShardCount") {
+        None => 1u32,
+        Some(value) => value
+            .as_u64()
+            .filter(|count| (1..=MAX_SHARD_COUNT).contains(count))
+            .ok_or_else(|| {
+                ApiError::validation(format!(
+                    "ShardCount must be an integer between 1 and {MAX_SHARD_COUNT}"
+                ))
+            })? as u32,
+    };
+    let retention_secs = match req.get("RetentionPeriodHours") {
+        None => None,
+        Some(value) => {
+            let hours = value.as_u64().ok_or_else(|| {
+                ApiError::validation("RetentionPeriodHours must be a non-negative integer")
+            })?;
+            Some(hours.checked_mul(3600).ok_or_else(|| {
+                ApiError::validation("RetentionPeriodHours is too large to represent")
+            })?)
+        }
+    };
     if !store.create_stream(name, shard_count, retention_secs) {
         return Err(ApiError::new(
             "ResourceInUseException",
@@ -100,12 +224,14 @@ pub fn create_stream(store: &mut Store, req: &Value) -> Result<Value, ApiError> 
     Ok(json!({}))
 }
 
-pub fn delete_stream(store: &mut Store, req: &Value) -> Result<Value, ApiError> {
-    let name = require_str(req, "StreamName")?;
-    if store.streams.remove(name).is_none() {
-        return Err(ApiError::not_found(format!("Stream {name} not found")));
-    }
-    Ok(json!({}))
+/// Remove a stream, returning its definition so the caller can restore it if the
+/// manifest can't be made durable.
+pub fn delete_stream(store: &mut Store, req: &Value) -> Result<Stream, ApiError> {
+    let name = resolve_stream_name(req)?;
+    store
+        .streams
+        .remove(name)
+        .ok_or_else(|| ApiError::not_found(format!("Stream {name} not found")))
 }
 
 pub fn put_record(
@@ -113,8 +239,9 @@ pub fn put_record(
     wal: Option<&mut Wal>,
     req: &Value,
 ) -> Result<Value, ApiError> {
-    let name = require_str(req, "StreamName")?;
+    let name = resolve_stream_name(req)?;
     let partition_key = require_str(req, "PartitionKey")?.to_string();
+    validate_partition_key(&partition_key)?;
     let data = decode_data(require_str(req, "Data")?)?;
     if data.len() > MAX_RECORD_BYTES {
         return Err(ApiError::validation(
@@ -130,10 +257,38 @@ pub fn put_record(
         .put(name, partition_key, data, explicit)
         .ok_or_else(|| ApiError::not_found(format!("Stream {name} not found")))?;
     if let Some(wal) = wal {
-        if let Some(rec) = store.last_record(name, &shard_id) {
-            if let Err(err) = wal.append(name, &shard_id, rec) {
-                eprintln!("fakestream: WAL append failed: {err}");
+        let Some(rec) = store.last_record(name, &shard_id) else {
+            // Unreachable while `put` appends before returning, but if that
+            // invariant ever breaks the record must not be acked as durable
+            // without a WAL frame behind it.
+            tracing::error!(
+                stream = name,
+                shard_id = %shard_id,
+                seq,
+                "record missing after put; nothing appended to WAL"
+            );
+            return Err(ApiError::internal("Record could not be durably persisted"));
+        };
+        if let Err(err) = wal.append(name, &shard_id, rec) {
+            // The record wasn't durably written; roll it back so we don't ack a
+            // seq that vanishes on restart (which would let the seq high-water
+            // regress and re-issue that number for a different record).
+            tracing::error!(
+                error = %err,
+                stream = name,
+                shard_id = %shard_id,
+                seq,
+                "WAL append failed"
+            );
+            if store.pop_record(name, &shard_id, seq).is_none() {
+                tracing::error!(
+                    stream = name,
+                    shard_id = %shard_id,
+                    seq,
+                    "rollback found no matching record at the shard tail"
+                );
             }
+            return Err(ApiError::internal("Record could not be durably persisted"));
         }
     }
     Ok(json!({ "ShardId": shard_id, "SequenceNumber": seq.to_string() }))
@@ -144,11 +299,20 @@ pub fn put_records(
     mut wal: Option<&mut Wal>,
     req: &Value,
 ) -> Result<Value, ApiError> {
-    let name = require_str(req, "StreamName")?;
+    let name = resolve_stream_name(req)?;
+    if !store.streams.contains_key(name) {
+        return Err(ApiError::not_found(format!("Stream {name} not found")));
+    }
     let records = req
         .get("Records")
         .and_then(Value::as_array)
         .ok_or_else(|| ApiError::validation("Missing required parameter: Records"))?;
+    if records.is_empty() {
+        return Err(ApiError::validation(
+            "1 validation error detected: Value at 'records' failed to satisfy constraint: \
+             Member must have length greater than or equal to 1",
+        ));
+    }
     if records.len() > MAX_PUT_RECORDS_COUNT {
         return Err(ApiError::validation(format!(
             "1 validation error detected: Value at 'records' failed to satisfy constraint: \
@@ -161,6 +325,7 @@ pub fn put_records(
     let mut aggregate = 0usize;
     for (i, record) in records.iter().enumerate() {
         let partition_key = require_str(record, "PartitionKey")?.to_string();
+        validate_partition_key(&partition_key)?;
         let data = decode_data(require_str(record, "Data")?)?;
         if data.len() > MAX_RECORD_BYTES {
             return Err(ApiError::validation(format!(
@@ -184,24 +349,53 @@ pub fn put_records(
     let mut out = Vec::with_capacity(decoded.len());
     let mut failed = 0u64;
     for (partition_key, data, explicit) in decoded {
-        match store.put(name, partition_key, data, explicit) {
-            Some((shard_id, seq)) => {
-                if let Some(wal) = wal.as_deref_mut() {
-                    if let Some(rec) = store.last_record(name, &shard_id) {
-                        if let Err(err) = wal.append(name, &shard_id, rec) {
-                            eprintln!("fakestream: WAL append failed: {err}");
-                        }
-                    }
-                }
-                out.push(json!({ "ShardId": shard_id, "SequenceNumber": seq.to_string() }));
-            }
-            None => {
-                failed += 1;
-                out.push(
-                    json!({ "ErrorCode": "ResourceNotFound", "ErrorMessage": "Stream not found" }),
+        // The stream exists (checked above) and shards span the full hash ring
+        // under a single write lock, so put always routes to a shard.
+        let Some((shard_id, seq)) = store.put(name, partition_key, data, explicit) else {
+            return Err(ApiError::not_found(format!("Stream {name} not found")));
+        };
+        if let Some(wal) = wal.as_deref_mut() {
+            let Some(rec) = store.last_record(name, &shard_id) else {
+                tracing::error!(
+                    stream = name,
+                    shard_id = %shard_id,
+                    seq,
+                    "record missing after put; nothing appended to WAL"
                 );
+                failed += 1;
+                out.push(json!({
+                    "ErrorCode": "InternalFailure",
+                    "ErrorMessage": "Record could not be durably persisted",
+                }));
+                continue;
+            };
+            if let Err(err) = wal.append(name, &shard_id, rec) {
+                // Per-record failure: roll the record back and report it so the
+                // client can retry, mirroring real Kinesis partial-failure batches.
+                tracing::error!(
+                    error = %err,
+                    stream = name,
+                    shard_id = %shard_id,
+                    seq,
+                    "WAL append failed"
+                );
+                if store.pop_record(name, &shard_id, seq).is_none() {
+                    tracing::error!(
+                        stream = name,
+                        shard_id = %shard_id,
+                        seq,
+                        "rollback found no matching record at the shard tail"
+                    );
+                }
+                failed += 1;
+                out.push(json!({
+                    "ErrorCode": "InternalFailure",
+                    "ErrorMessage": "Record could not be durably persisted",
+                }));
+                continue;
             }
         }
+        out.push(json!({ "ShardId": shard_id, "SequenceNumber": seq.to_string() }));
     }
     Ok(json!({ "FailedRecordCount": failed, "Records": out }))
 }
@@ -229,7 +423,7 @@ pub fn list_streams(store: &Store, _req: &Value) -> Result<Value, ApiError> {
 }
 
 pub fn describe_stream(store: &Store, req: &Value) -> Result<Value, ApiError> {
-    let stream = lookup(store, require_str(req, "StreamName")?)?;
+    let stream = lookup(store, resolve_stream_name(req)?)?;
     let shards: Vec<Value> = stream.shards.iter().map(shard_json).collect();
     Ok(json!({
         "StreamDescription": {
@@ -248,8 +442,8 @@ pub fn describe_stream(store: &Store, req: &Value) -> Result<Value, ApiError> {
 }
 
 pub fn describe_stream_summary(store: &Store, req: &Value) -> Result<Value, ApiError> {
-    let stream = lookup(store, require_str(req, "StreamName")?)?;
-    let open = stream.shards.iter().filter(|s| !s.closed).count();
+    let stream = lookup(store, resolve_stream_name(req)?)?;
+    let open = stream.shards.len();
     Ok(json!({
         "StreamDescriptionSummary": {
             "StreamName": stream.name,
@@ -266,30 +460,72 @@ pub fn describe_stream_summary(store: &Store, req: &Value) -> Result<Value, ApiE
 }
 
 pub fn list_shards(store: &Store, req: &Value) -> Result<Value, ApiError> {
-    let name = req
-        .get("StreamName")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ApiError::validation("StreamName is required"))?;
-    let stream = lookup(store, name)?;
+    let stream = lookup(store, resolve_stream_name(req)?)?;
     let shards: Vec<Value> = stream.shards.iter().map(shard_json).collect();
     Ok(json!({ "Shards": shards }))
 }
 
 pub fn get_shard_iterator(store: &Store, req: &Value) -> Result<Value, ApiError> {
-    let name = require_str(req, "StreamName")?;
+    let name = resolve_stream_name(req)?;
     let shard_id = require_str(req, "ShardId")?;
     let iterator_type = require_str(req, "ShardIteratorType")?;
-    let starting =
-        match req.get("StartingSequenceNumber").and_then(Value::as_str) {
-            Some(text) => Some(text.parse::<u64>().map_err(|_| {
+    // A present-but-mistyped field is a type error, not a missing one, matching
+    // how StreamName/StreamARN reject non-strings. Treat JSON null as absent.
+    let starting = match req.get("StartingSequenceNumber") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let text = value
+                .as_str()
+                .ok_or_else(|| ApiError::validation("StartingSequenceNumber must be a string"))?;
+            Some(text.parse::<u64>().map_err(|_| {
                 ApiError::new("ValidationException", "Invalid StartingSequenceNumber")
-            })?),
-            None => None,
-        };
-    let timestamp_ms = req
-        .get("Timestamp")
-        .and_then(Value::as_f64)
-        .map(|secs| (secs * 1000.0) as u128);
+            })?)
+        }
+    };
+    let timestamp_ms = match req.get("Timestamp") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let secs = value
+                .as_f64()
+                .ok_or_else(|| ApiError::validation("Timestamp must be a number"))?;
+            if secs < 0.0 {
+                return Err(ApiError::validation(format!(
+                    "Timestamp must not be before the Unix epoch: {secs}"
+                )));
+            }
+            // The cast is exact for any realistic epoch value and secs is
+            // non-negative here, so it cannot saturate to a misleading 0.
+            Some((secs * 1000.0) as u128)
+        }
+    };
+    // Classify argument errors before touching the store so a bad iterator type
+    // or a missing StartingSequenceNumber doesn't masquerade as a deleted shard.
+    match iterator_type {
+        "TRIM_HORIZON" | "LATEST" => {}
+        "AT_TIMESTAMP" => {
+            if timestamp_ms.is_none() {
+                return Err(ApiError::new(
+                    "InvalidArgumentException",
+                    "Timestamp is required for ShardIteratorType AT_TIMESTAMP",
+                ));
+            }
+        }
+        "AT_SEQUENCE_NUMBER" | "AFTER_SEQUENCE_NUMBER" => {
+            if starting.is_none() {
+                return Err(ApiError::new(
+                    "InvalidArgumentException",
+                    format!(
+                        "StartingSequenceNumber is required for ShardIteratorType {iterator_type}"
+                    ),
+                ));
+            }
+        }
+        other => {
+            return Err(ApiError::validation(format!(
+                "Invalid ShardIteratorType: {other}"
+            )));
+        }
+    }
     lookup(store, name)?;
     let it = store
         .make_iterator(name, shard_id, iterator_type, starting, timestamp_ms)
@@ -309,11 +545,18 @@ pub fn get_records(store: &Store, req: &Value) -> Result<(Vec<u8>, u64, u64), Ap
             "Iterator expired (5 min TTL)",
         ));
     }
-    let limit = req
-        .get("Limit")
-        .and_then(Value::as_u64)
-        .unwrap_or(MAX_GET_RECORDS)
-        .min(MAX_GET_RECORDS) as usize;
+    let limit = match req.get("Limit") {
+        None => MAX_GET_RECORDS as usize,
+        Some(value) => value
+            .as_u64()
+            .filter(|limit| (1..=MAX_GET_RECORDS).contains(limit))
+            .ok_or_else(|| {
+                ApiError::validation(
+                    "1 validation error detected: Value at 'limit' failed to satisfy \
+                     constraint: Member must have value between 1 and 10000",
+                )
+            })? as usize,
+    };
     let stream = lookup(store, &it.stream)?;
     let shard = stream
         .shards
@@ -344,13 +587,11 @@ pub fn get_records(store: &Store, req: &Value) -> Result<(Vec<u8>, u64, u64), Ap
         selected.push(record);
     }
 
-    let latest_seq = shard.records.last().map(|r| r.seq).unwrap_or(0);
+    let latest_seq = shard.records.last().map_or(0, |r| r.seq);
     let millis_behind = if next_seq > latest_seq {
         0
     } else {
-        last_ts
-            .map(|ts| now_ms().saturating_sub(ts) as u64)
-            .unwrap_or(0)
+        last_ts.map_or(0, |ts| now_ms().saturating_sub(ts) as u64)
     };
     let next = Iterator {
         next_seq,
@@ -396,6 +637,10 @@ fn serialize_get_records(records: &[&Record], next_iterator: &str, millis_behind
 }
 
 /// Write a single record object, base64-encoding its data straight into `out`.
+#[expect(
+    clippy::expect_used,
+    reason = "serde_json writes to Vec<u8>, whose Write implementation is infallible"
+)]
 fn write_record(out: &mut Vec<u8>, record: &Record) {
     out.extend_from_slice(b"{\"SequenceNumber\":\"");
     out.extend_from_slice(record.seq.to_string().as_bytes());
@@ -412,6 +657,10 @@ fn write_record(out: &mut Vec<u8>, record: &Record) {
 }
 
 /// Write a properly-escaped JSON string (including the surrounding quotes).
+#[expect(
+    clippy::expect_used,
+    reason = "serde_json writes to Vec<u8>, whose Write implementation is infallible"
+)]
 fn write_json_string(out: &mut Vec<u8>, value: &str) {
     serde_json::to_writer(&mut *out, value).expect("string serialization is infallible");
 }
@@ -485,6 +734,61 @@ mod tests {
     }
 
     #[test]
+    fn put_records_rejects_empty_batch() {
+        let mut store = store_with_stream();
+        let req = json!({ "StreamName": "S", "Records": [] });
+        assert_eq!(
+            put_records(&mut store, None, &req).unwrap_err().kind,
+            "ValidationException"
+        );
+    }
+
+    #[test]
+    fn put_record_rejects_empty_partition_key() {
+        let mut store = store_with_stream();
+        let req = json!({ "StreamName": "S", "PartitionKey": "", "Data": encode_data(&[1]) });
+        assert_eq!(
+            put_record(&mut store, None, &req).unwrap_err().kind,
+            "ValidationException"
+        );
+    }
+
+    #[test]
+    fn put_record_rejects_oversized_partition_key() {
+        let mut store = store_with_stream();
+        let pk = "x".repeat(MAX_PARTITION_KEY_CHARS + 1);
+        let req = json!({ "StreamName": "S", "PartitionKey": pk, "Data": encode_data(&[1]) });
+        assert_eq!(
+            put_record(&mut store, None, &req).unwrap_err().kind,
+            "ValidationException"
+        );
+    }
+
+    #[test]
+    fn put_record_accepts_max_length_partition_key() {
+        let mut store = store_with_stream();
+        let pk = "x".repeat(MAX_PARTITION_KEY_CHARS);
+        let req = json!({ "StreamName": "S", "PartitionKey": pk, "Data": encode_data(&[1]) });
+        assert!(put_record(&mut store, None, &req).is_ok());
+    }
+
+    #[test]
+    fn put_records_rejects_bad_partition_key_without_storing() {
+        let mut store = store_with_stream();
+        let req = json!({ "StreamName": "S", "Records": [
+            { "PartitionKey": "", "Data": encode_data(&[1]) }
+        ]});
+        assert_eq!(
+            put_records(&mut store, None, &req).unwrap_err().kind,
+            "ValidationException"
+        );
+        assert_eq!(
+            store.stream_sizes().iter().map(|(_, n, _)| n).sum::<u64>(),
+            0
+        );
+    }
+
+    #[test]
     fn put_record_rejects_over_1mib() {
         let mut store = store_with_stream();
         let err = put_record(&mut store, None, &put_req(MAX_RECORD_BYTES + 1)).unwrap_err();
@@ -498,14 +802,15 @@ mod tests {
     }
 
     #[test]
-    fn put_records_reports_failures_for_unknown_stream() {
+    fn put_records_rejects_unknown_stream() {
         let mut store = Store::new(86_400); // NO stream created
         let req = json!({ "StreamName": "MISSING", "Records": [
             { "PartitionKey": "p", "Data": encode_data(&[1, 2, 3]) }
         ]});
-        let out = put_records(&mut store, None, &req).unwrap();
-        assert_eq!(out["FailedRecordCount"], 1);
-        assert_eq!(out["Records"][0]["ErrorCode"], "ResourceNotFound");
+        assert_eq!(
+            put_records(&mut store, None, &req).unwrap_err().kind,
+            "ResourceNotFoundException"
+        );
     }
 
     #[test]
@@ -521,6 +826,343 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, "S"); // stream name recorded
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn put_record_returns_internal_failure_when_append_fails() {
+        use crate::wal::Wal;
+        let dir = std::env::temp_dir().join(format!("fs-ops-walfail1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = store_with_stream();
+        // segment_max 0 makes every append roll first; removing the wal dir then
+        // makes the roll's create-open fail, forcing a WAL append error.
+        let (mut wal, _) = Wal::load(&dir, 0).unwrap();
+        std::fs::remove_dir_all(dir.join("wal")).unwrap();
+        let err = put_record(&mut store, Some(&mut wal), &put_req(4)).unwrap_err();
+        assert_eq!(err.kind, "InternalFailure");
+        // Rolled back: the un-persisted record is not left in the store.
+        assert_eq!(
+            store.stream_sizes().iter().map(|(_, n, _)| n).sum::<u64>(),
+            0
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn put_records_reports_internal_failure_when_append_fails() {
+        use crate::wal::Wal;
+        let dir = std::env::temp_dir().join(format!("fs-ops-walfail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = store_with_stream();
+        // segment_max 0 makes every append roll first; removing the wal dir then
+        // makes the roll's create-open fail, forcing a WAL append error.
+        let (mut wal, _) = Wal::load(&dir, 0).unwrap();
+        std::fs::remove_dir_all(dir.join("wal")).unwrap();
+        let req = records_req(vec![(1, 4)]);
+        let out = put_records(&mut store, Some(&mut wal), &req).unwrap();
+        assert_eq!(out["FailedRecordCount"], 1);
+        assert_eq!(out["Records"][0]["ErrorCode"], "InternalFailure");
+        // Rolled back: the un-persisted record is not left in the store.
+        assert_eq!(
+            store.stream_sizes().iter().map(|(_, n, _)| n).sum::<u64>(),
+            0
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn describe_stream_accepts_stream_arn() {
+        let store = store_with_stream();
+        let arn = store.streams["S"].arn.clone();
+        let out = describe_stream(&store, &json!({ "StreamARN": arn })).unwrap();
+        assert_eq!(out["StreamDescription"]["StreamName"], "S");
+    }
+
+    #[test]
+    fn describe_stream_rejects_malformed_arn() {
+        let store = store_with_stream();
+        assert_eq!(
+            describe_stream(&store, &json!({ "StreamARN": "not-an-arn" }))
+                .unwrap_err()
+                .kind,
+            "ValidationException"
+        );
+    }
+
+    #[test]
+    fn describe_stream_rejects_substring_only_arn() {
+        let store = store_with_stream();
+        let error =
+            describe_stream(&store, &json!({ "StreamARN": "garbage:stream/S" })).unwrap_err();
+        assert_eq!(error.kind, "ValidationException");
+    }
+
+    #[test]
+    fn describe_stream_rejects_extra_arn_resource_components() {
+        let store = store_with_stream();
+        let arn = "arn:aws:kinesis:us-east-1:000000000000:stream/other/S";
+        let error = describe_stream(&store, &json!({ "StreamARN": arn })).unwrap_err();
+        assert_eq!(error.kind, "ValidationException");
+    }
+
+    #[test]
+    fn describe_stream_rejects_non_string_stream_name() {
+        let store = store_with_stream();
+        let arn = store.streams["S"].arn.clone();
+        let error =
+            describe_stream(&store, &json!({ "StreamName": 123, "StreamARN": arn })).unwrap_err();
+        assert_eq!(error.kind, "ValidationException");
+    }
+
+    #[test]
+    fn describe_stream_rejects_non_string_stream_arn() {
+        let store = store_with_stream();
+        let error =
+            describe_stream(&store, &json!({ "StreamName": "S", "StreamARN": 123 })).unwrap_err();
+        assert_eq!(error.kind, "ValidationException");
+    }
+
+    #[test]
+    fn describe_stream_rejects_arn_name_mismatch() {
+        let store = store_with_stream();
+        let arn = store.streams["S"].arn.clone();
+        assert_eq!(
+            describe_stream(&store, &json!({ "StreamName": "other", "StreamARN": arn }))
+                .unwrap_err()
+                .kind,
+            "ValidationException"
+        );
+    }
+
+    #[test]
+    fn describe_stream_accepts_matching_name_and_arn() {
+        let store = store_with_stream();
+        let arn = store.streams["S"].arn.clone();
+        let out = describe_stream(&store, &json!({ "StreamName": "S", "StreamARN": arn })).unwrap();
+        assert_eq!(out["StreamDescription"]["StreamName"], "S");
+    }
+
+    // ---- ARN acceptance on data-plane ops + DeleteStream ------------------------
+
+    #[test]
+    fn delete_stream_rejects_unknown_stream() {
+        let mut store = Store::new(86_400);
+        assert_eq!(
+            delete_stream(&mut store, &json!({ "StreamName": "MISSING" }))
+                .unwrap_err()
+                .kind,
+            "ResourceNotFoundException"
+        );
+    }
+
+    #[test]
+    fn delete_stream_accepts_stream_arn() {
+        let mut store = store_with_stream();
+        let arn = store.streams["S"].arn.clone();
+        delete_stream(&mut store, &json!({ "StreamARN": arn })).unwrap();
+        assert!(store.streams.is_empty());
+    }
+
+    #[test]
+    fn put_record_accepts_stream_arn() {
+        let mut store = store_with_stream();
+        let arn = store.streams["S"].arn.clone();
+        let req = json!({ "StreamARN": arn, "PartitionKey": "p", "Data": encode_data(&[1]) });
+        assert!(put_record(&mut store, None, &req).is_ok());
+    }
+
+    #[test]
+    fn put_records_accepts_stream_arn() {
+        let mut store = store_with_stream();
+        let arn = store.streams["S"].arn.clone();
+        let req = json!({ "StreamARN": arn, "Records": [
+            { "PartitionKey": "p", "Data": encode_data(&[1]) }
+        ]});
+        let out = put_records(&mut store, None, &req).unwrap();
+        assert_eq!(out["FailedRecordCount"], 0);
+    }
+
+    #[test]
+    fn get_shard_iterator_accepts_stream_arn() {
+        let store = store_with_stream();
+        let arn = store.streams["S"].arn.clone();
+        let req = json!({
+            "StreamARN": arn,
+            "ShardId": "shardId-000000000000",
+            "ShardIteratorType": "TRIM_HORIZON",
+        });
+        assert!(get_shard_iterator(&store, &req).is_ok());
+    }
+
+    #[test]
+    fn create_stream_retention_zero_means_keep_forever() {
+        let mut store = Store::new(86_400);
+        create_stream(
+            &mut store,
+            &json!({ "StreamName": "S", "RetentionPeriodHours": 0 }),
+        )
+        .unwrap();
+        // 0 disables trimming (see Store::trim_expired); the API must pass it
+        // through rather than falling back to the store default.
+        assert_eq!(store.streams["S"].retention_secs, 0);
+    }
+
+    // ---- CreateStream name validation ------------------------------------------
+
+    fn create(name: &str) -> Result<Value, ApiError> {
+        create_stream(&mut Store::new(86_400), &json!({ "StreamName": name }))
+    }
+
+    #[test]
+    fn create_stream_accepts_128_char_name() {
+        assert!(create(&"a".repeat(128)).is_ok());
+    }
+
+    #[test]
+    fn create_stream_rejects_129_char_name() {
+        assert_eq!(
+            create(&"a".repeat(129)).unwrap_err().kind,
+            "ValidationException"
+        );
+    }
+
+    #[test]
+    fn create_stream_rejects_illegal_characters() {
+        assert_eq!(create("bad\"name").unwrap_err().kind, "ValidationException");
+    }
+
+    #[test]
+    fn create_stream_rejects_empty_name() {
+        assert_eq!(create("").unwrap_err().kind, "ValidationException");
+    }
+
+    fn create_full(req: &Value) -> Result<Value, ApiError> {
+        create_stream(&mut Store::new(86_400), req)
+    }
+
+    #[test]
+    fn create_stream_accepts_shard_count_boundaries() {
+        assert!(create_full(&json!({ "StreamName": "S", "ShardCount": 1 })).is_ok());
+        assert!(create_full(&json!({ "StreamName": "S", "ShardCount": 10_000 })).is_ok());
+    }
+
+    #[test]
+    fn create_stream_rejects_bad_shard_count() {
+        for value in [json!(0), json!(10_001), json!(1.5)] {
+            assert_eq!(
+                create_full(&json!({ "StreamName": "S", "ShardCount": value }))
+                    .unwrap_err()
+                    .kind,
+                "ValidationException"
+            );
+        }
+    }
+
+    #[test]
+    fn create_stream_accepts_short_retention() {
+        let out = create_full(&json!({ "StreamName": "S", "RetentionPeriodHours": 1 }));
+        assert!(out.is_ok());
+    }
+
+    #[test]
+    fn create_stream_rejects_overflowing_retention() {
+        assert_eq!(
+            create_full(&json!({ "StreamName": "S", "RetentionPeriodHours": u64::MAX }))
+                .unwrap_err()
+                .kind,
+            "ValidationException"
+        );
+    }
+
+    #[test]
+    fn create_stream_rejects_mistyped_retention() {
+        for value in [json!(-1), json!(1.5), json!("24")] {
+            assert_eq!(
+                create_full(&json!({ "StreamName": "S", "RetentionPeriodHours": value }))
+                    .unwrap_err()
+                    .kind,
+                "ValidationException"
+            );
+        }
+    }
+
+    // ---- GetShardIterator argument classification ------------------------------
+
+    fn iterator_req(shard_id: &str, iterator_type: &str) -> Value {
+        json!({ "StreamName": "S", "ShardId": shard_id, "ShardIteratorType": iterator_type })
+    }
+
+    #[test]
+    fn get_shard_iterator_rejects_unknown_type() {
+        let store = store_with_stream();
+        let req = iterator_req("shardId-000000000000", "BOGUS");
+        assert_eq!(
+            get_shard_iterator(&store, &req).unwrap_err().kind,
+            "ValidationException"
+        );
+    }
+
+    #[test]
+    fn get_shard_iterator_requires_sequence_number() {
+        let store = store_with_stream();
+        let req = iterator_req("shardId-000000000000", "AT_SEQUENCE_NUMBER");
+        assert_eq!(
+            get_shard_iterator(&store, &req).unwrap_err().kind,
+            "InvalidArgumentException"
+        );
+    }
+
+    #[test]
+    fn get_shard_iterator_requires_timestamp() {
+        let store = store_with_stream();
+        let req = iterator_req("shardId-000000000000", "AT_TIMESTAMP");
+        assert_eq!(
+            get_shard_iterator(&store, &req).unwrap_err().kind,
+            "InvalidArgumentException"
+        );
+    }
+
+    #[test]
+    fn get_shard_iterator_unknown_shard_is_not_found() {
+        let store = store_with_stream();
+        let req = iterator_req("shardId-000000000099", "TRIM_HORIZON");
+        assert_eq!(
+            get_shard_iterator(&store, &req).unwrap_err().kind,
+            "ResourceNotFoundException"
+        );
+    }
+
+    #[test]
+    fn get_shard_iterator_rejects_non_numeric_timestamp() {
+        let store = store_with_stream();
+        let mut req = iterator_req("shardId-000000000000", "AT_TIMESTAMP");
+        req["Timestamp"] = json!("soon");
+        assert_eq!(
+            get_shard_iterator(&store, &req).unwrap_err().kind,
+            "ValidationException"
+        );
+    }
+
+    #[test]
+    fn get_shard_iterator_rejects_non_string_sequence_number() {
+        let store = store_with_stream();
+        let mut req = iterator_req("shardId-000000000000", "AT_SEQUENCE_NUMBER");
+        req["StartingSequenceNumber"] = json!(1);
+        assert_eq!(
+            get_shard_iterator(&store, &req).unwrap_err().kind,
+            "ValidationException"
+        );
+    }
+
+    #[test]
+    fn get_shard_iterator_rejects_negative_timestamp() {
+        let store = store_with_stream();
+        let mut req = iterator_req("shardId-000000000000", "AT_TIMESTAMP");
+        req["Timestamp"] = json!(-1);
+        assert_eq!(
+            get_shard_iterator(&store, &req).unwrap_err().kind,
+            "ValidationException"
+        );
     }
 
     // ---- GetRecords serialization + 10 MiB cap ---------------------------------
@@ -544,6 +1186,34 @@ mod tests {
         }
         let (body, count, bytes) = get_records(store, &req).unwrap();
         (serde_json::from_slice(&body).unwrap(), count, bytes)
+    }
+
+    #[test]
+    fn at_timestamp_iterator_reads_from_matching_record() {
+        let mut store = store_with_stream();
+        store.put("S", "pk".into(), vec![1], None);
+        let mut req = iterator_req("shardId-000000000000", "AT_TIMESTAMP");
+        req["Timestamp"] = json!(0);
+        let token = get_shard_iterator(&store, &req).unwrap()["ShardIterator"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (_, count, _) = get_records(&store, &json!({ "ShardIterator": token })).unwrap();
+        assert_eq!(count, 1, "timestamp 0 starts at the first stored record");
+    }
+
+    #[test]
+    fn at_timestamp_iterator_after_all_records_reads_nothing() {
+        let mut store = store_with_stream();
+        store.put("S", "pk".into(), vec![1], None);
+        let mut req = iterator_req("shardId-000000000000", "AT_TIMESTAMP");
+        req["Timestamp"] = json!(4_102_444_800u64); // 2100-01-01, after any test record
+        let token = get_shard_iterator(&store, &req).unwrap()["ShardIterator"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (_, count, _) = get_records(&store, &json!({ "ShardIterator": token })).unwrap();
+        assert_eq!(count, 0, "a timestamp past every record starts at the tail");
     }
 
     #[test]
@@ -576,6 +1246,29 @@ mod tests {
         let (v, count, _) = get(&store, &token, Some(2));
         assert_eq!(count, 2);
         assert_eq!(v["Records"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn get_records_accepts_limit_boundaries() {
+        let store = store_with_stream();
+        let token = iterator_token(&store, "TRIM_HORIZON");
+        for limit in [1u64, MAX_GET_RECORDS] {
+            let req = json!({ "ShardIterator": token, "Limit": limit });
+            assert!(get_records(&store, &req).is_ok());
+        }
+    }
+
+    #[test]
+    fn get_records_rejects_out_of_range_limit() {
+        let store = store_with_stream();
+        let token = iterator_token(&store, "TRIM_HORIZON");
+        for limit in [json!(0), json!(MAX_GET_RECORDS + 1)] {
+            let req = json!({ "ShardIterator": token, "Limit": limit });
+            assert_eq!(
+                get_records(&store, &req).unwrap_err().kind,
+                "ValidationException"
+            );
+        }
     }
 
     #[test]

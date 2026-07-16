@@ -14,7 +14,8 @@ mod protocol;
 mod store;
 mod wal;
 
-use std::sync::{Arc, Mutex, RwLock};
+use std::io::{self, Read};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread;
 use std::time::Duration;
 
@@ -31,6 +32,21 @@ const WORKER_THREADS: usize = 4;
 const DEFAULT_PERSIST_INTERVAL_SECS: u64 = 5;
 const DEFAULT_RETENTION_SECS: u64 = 24 * 3600;
 const DEFAULT_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
+// 16 MiB, comfortably above the 5 MiB PutRecords decoded limit after base64 +
+// JSON inflation. Bounds per-request memory against an oversized body.
+const MAX_REQUEST_BODY_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Reject bodies that overran the 16 MiB cap. Callers read through
+/// `take(MAX_REQUEST_BODY_BYTES + 1)`, so a length past the cap means the
+/// request was oversized — the extra byte only exists to signal overflow.
+fn check_body_size(len: u64) -> Result<(), ApiError> {
+    if len > MAX_REQUEST_BODY_BYTES {
+        return Err(ApiError::validation(
+            "Request body exceeds the 16 MiB limit",
+        ));
+    }
+    Ok(())
+}
 
 /// A handled operation's result: a small `Value` for most ops, or a pre-built
 /// JSON body for GetRecords (serialized in `ops` straight into one buffer to
@@ -49,20 +65,30 @@ struct Config {
     segment_bytes: u64,
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .with_ansi(false)
+        .without_time()
+        .init();
+
     let config = Config::load();
     let addr = format!("0.0.0.0:{}", config.port);
 
-    let server = Arc::new(Server::http(&addr).expect("failed to bind fakestream HTTP server"));
+    let server = Arc::new(Server::http(&addr)?);
     let (store, wal) = load_state(&config);
     let store = Arc::new(RwLock::new(store));
     let wal = wal.map(|w| Arc::new(Mutex::new(w)));
     let persist_dir = config.persist_dir.clone();
-    println!("fakestream listening on http://{addr} (Kinesis, AWS JSON 1.1)");
-    println!("  retention: {}s default", config.default_retention_secs);
-    match &persist_dir {
-        Some(dir) => println!("  persistence: {dir}"),
-        None => println!("  persistence: off"),
+    tracing::info!(address = %addr, "fakestream listening (Kinesis, AWS JSON 1.1)");
+    tracing::info!(
+        retention_secs = config.default_retention_secs,
+        "default retention"
+    );
+    if let Some(dir) = &persist_dir {
+        tracing::info!(path = %dir, "persistence enabled");
+    } else {
+        tracing::info!("persistence disabled");
     }
 
     spawn_maintenance(&store, &wal, &persist_dir, config.persist_interval_secs);
@@ -85,6 +111,7 @@ fn main() {
     for handle in handles {
         let _ = handle.join();
     }
+    Ok(())
 }
 
 impl Config {
@@ -101,7 +128,7 @@ impl Config {
             .or_else(|| {
                 opt("--retention-hours", "FAKESTREAM_RETENTION_HOURS")
                     .and_then(|v| v.parse::<u64>().ok())
-                    .map(|hours| hours * 3600)
+                    .and_then(|hours| hours.checked_mul(3600))
             })
             .unwrap_or(DEFAULT_RETENTION_SECS);
         let persist_dir = opt("--persist", "FAKESTREAM_PERSIST_PATH").filter(|v| !v.is_empty());
@@ -131,7 +158,7 @@ fn load_state(config: &Config) -> (Store, Option<Wal>) {
     let (wal, entries) = match Wal::load(dir, config.segment_bytes) {
         Ok(pair) => pair,
         Err(err) => {
-            eprintln!("fakestream: WAL open failed ({err}); starting without persistence");
+            tracing::warn!(error = %err, "WAL open failed; starting without persistence");
             return (store, None);
         }
     };
@@ -147,7 +174,7 @@ fn load_state(config: &Config) -> (Store, Option<Wal>) {
     store.bump_seq_to(max_seq);
     let removed = store.trim_expired(now_ms());
     if removed > 0 {
-        println!("  replayed WAL, trimmed {removed} expired record(s)");
+        tracing::info!(removed, "replayed WAL and trimmed expired records");
     }
     (store, Some(wal))
 }
@@ -167,30 +194,34 @@ fn spawn_maintenance(
     thread::spawn(move || loop {
         thread::sleep(interval);
         let now = now_ms();
-        store
-            .write()
-            .expect("store lock poisoned")
-            .trim_expired(now);
+        write(&store).trim_expired(now);
         if let (Some(wal), Some(dir)) = (&wal, &persist_dir) {
-            // Persist the manifest (carrying the current seq high-water) BEFORE
-            // dropping segments so a crash can't lose it. Lock discipline is
-            // store-then-wal: release the store read lock before taking the wal.
-            let retention = {
-                let store = store.read().expect("store lock poisoned");
-                if let Err(err) = manifest::save(std::path::Path::new(dir), &store) {
-                    eprintln!("fakestream: manifest save failed: {err}");
-                }
-                store.max_retention_secs()
-            };
-            if let Err(err) = wal
-                .lock()
-                .expect("wal lock poisoned")
-                .drop_expired(now, retention)
-            {
-                eprintln!("fakestream: segment drop failed: {err}");
-            }
+            persist_and_gc(&store, wal, std::path::Path::new(dir), now);
         }
     });
+}
+
+/// One persistence pass: refresh the manifest, then drop fully-expired WAL
+/// segments. The manifest (carrying the current seq high-water) is saved BEFORE
+/// dropping segments so a crash can't lose it — and if the save fails, the GC
+/// is skipped entirely: the on-disk manifest may still list a stream that was
+/// deleted in memory, and dropping its segments would let a crash recover the
+/// stream's definition with its records gone.
+///
+/// The store read lock is held across the whole pass — snapshot AND wal drop —
+/// so a concurrent `CreateStream` + roll can't slip a fresh closed segment past
+/// a stale retention snapshot and have GC delete its already-acked records. Lock
+/// order stays store-then-wal, matching `with_wal`, so this can't deadlock.
+fn persist_and_gc(store: &RwLock<Store>, wal: &Mutex<Wal>, dir: &std::path::Path, now: u128) {
+    let store = read(store);
+    if let Err(err) = manifest::save(dir, &store) {
+        tracing::error!(error = %err, "manifest save failed");
+        return;
+    }
+    let retentions = store.stream_retentions();
+    if let Err(err) = lock_wal(wal).drop_expired(now, &retentions) {
+        tracing::error!(error = %err, "WAL segment drop failed");
+    }
 }
 
 /// Read a value from an env var, falling back to a CLI flag.
@@ -218,10 +249,8 @@ fn handle(
     if request.method() == &Method::Get {
         if request.url() == "/metrics" {
             let body = metrics.render(&read(store));
-            let header =
-                Header::from_bytes(&b"Content-Type"[..], &b"text/plain; version=0.0.4"[..])
-                    .expect("static header is valid");
-            let _ = request.respond(Response::from_string(body).with_header(header));
+            let response = Response::from_string(body).with_header(metrics_header());
+            let _ = request.respond(response);
         } else {
             let _ = request.respond(Response::from_string("fakestream ok"));
         }
@@ -233,14 +262,39 @@ fn handle(
         .find(|h| h.field.equiv("X-Amz-Target"))
         .map(|h| h.value.as_str().to_string());
 
-    let mut body = String::new();
-    if request.as_reader().read_to_string(&mut body).is_err() {
+    let mut raw = Vec::new();
+    // Read one byte past the cap with `take`: an oversized body is detected
+    // after buffering at most one byte over the limit, without draining an
+    // arbitrarily large request. Read raw bytes and size-check them before
+    // decoding UTF-8, so an oversized body is classified as a size error even
+    // when the cap cuts mid-way through a multibyte character.
+    let mut reader = request.as_reader().take(MAX_REQUEST_BODY_BYTES + 1);
+    if reader.read_to_end(&mut raw).is_err() {
         respond_error(
             request,
             &ApiError::new("SerializationException", "Unreadable request body"),
         );
         return;
     }
+    if let Err(err) = check_body_size(raw.len() as u64) {
+        // We buffered at most the cap. Dropping the request now would make
+        // tiny_http's EqualReader drain the unread declared Content-Length in a
+        // single `vec![0; remaining]` allocation (util/equal_reader.rs). Drain it
+        // here in bounded chunks so a genuinely oversized upload can't force that
+        // one large allocation. (A client that lies about Content-Length and then
+        // closes still leaves EqualReader one over-declared, lazily-zeroed alloc
+        // we can't avoid without patching the dependency.)
+        let _ = io::copy(&mut request.as_reader(), &mut io::sink());
+        respond_error(request, &err);
+        return;
+    }
+    let Ok(body) = String::from_utf8(raw) else {
+        respond_error(
+            request,
+            &ApiError::new("SerializationException", "Unreadable request body"),
+        );
+        return;
+    };
 
     match route(target.as_deref(), &body, store, wal, persist_dir, metrics) {
         Ok(OpResponse::Json(json)) => respond_ok_json(request, &json),
@@ -264,7 +318,7 @@ fn route(
         )
     })?;
     let req: Value = if body.trim().is_empty() {
-        Value::Object(Default::default())
+        Value::Object(serde_json::Map::new())
     } else {
         serde_json::from_str(body).map_err(|_| {
             ApiError::new("SerializationException", "Request body is not valid JSON")
@@ -282,22 +336,8 @@ fn route(
     }
 
     let result = match op {
-        "CreateStream" => {
-            let mut s = write(store);
-            let result = ops::create_stream(&mut s, &req);
-            if result.is_ok() {
-                save_manifest(persist_dir, &s);
-            }
-            result
-        }
-        "DeleteStream" => {
-            let mut s = write(store);
-            let result = ops::delete_stream(&mut s, &req);
-            if result.is_ok() {
-                save_manifest(persist_dir, &s);
-            }
-            result
-        }
+        "CreateStream" => create_stream_durably(&mut write(store), persist_dir, &req),
+        "DeleteStream" => delete_stream_durably(&mut write(store), persist_dir, &req),
         "PutRecord" => with_wal(store, wal, |s, w| ops::put_record(s, w, &req)),
         "PutRecords" => with_wal(store, wal, |s, w| ops::put_records(s, w, &req)),
         "ListStreams" => ops::list_streams(&read(store), &req),
@@ -311,24 +351,23 @@ fn route(
         )),
     };
 
-    if result.is_ok() {
+    if let Ok(response) = &result {
         match op {
             "PutRecord" => {
                 let bytes = req
                     .get("Data")
                     .and_then(Value::as_str)
-                    .map(b64_decoded_len)
-                    .unwrap_or(0);
+                    .map_or(0, b64_decoded_len);
                 metrics.add_put(1, bytes);
             }
             "PutRecords" => {
-                if let Some(records) = req.get("Records").and_then(Value::as_array) {
-                    let bytes = records
-                        .iter()
-                        .filter_map(|r| r.get("Data").and_then(Value::as_str))
-                        .map(b64_decoded_len)
-                        .sum();
-                    metrics.add_put(records.len() as u64, bytes);
+                if let (Some(request_records), Some(response_records)) = (
+                    req.get("Records").and_then(Value::as_array),
+                    response.get("Records").and_then(Value::as_array),
+                ) {
+                    let (records, bytes) =
+                        successful_put_metrics(request_records, response_records);
+                    metrics.add_put(records, bytes);
                 }
             }
             _ => {}
@@ -338,6 +377,26 @@ fn route(
     result.map(OpResponse::Json)
 }
 
+/// Count records and decoded bytes for the PutRecords entries that succeeded,
+/// correlating each request record with its same-index response entry. Entries
+/// whose response carries an `ErrorCode` failed routing and are excluded so
+/// metrics never over-count a partially-failed batch.
+fn successful_put_metrics(request_records: &[Value], response_records: &[Value]) -> (u64, u64) {
+    let mut records = 0u64;
+    let mut bytes = 0u64;
+    for (request, result) in request_records.iter().zip(response_records) {
+        if result.get("ErrorCode").is_some() {
+            continue;
+        }
+        records += 1;
+        bytes += request
+            .get("Data")
+            .and_then(Value::as_str)
+            .map_or(0, b64_decoded_len);
+    }
+    (records, bytes)
+}
+
 /// Run a write op under the store write lock, with the WAL locked alongside it
 /// (or `None` when persistence is off).
 fn with_wal(
@@ -345,33 +404,97 @@ fn with_wal(
     wal: &Option<Arc<Mutex<Wal>>>,
     f: impl FnOnce(&mut Store, Option<&mut Wal>) -> Result<Value, ApiError>,
 ) -> Result<Value, ApiError> {
-    let mut store = store.write().expect("store lock poisoned");
+    let mut store = write(store);
     match wal {
         Some(w) => {
-            let mut wal = w.lock().expect("wal lock poisoned");
+            let mut wal = lock_wal(w);
             f(&mut store, Some(&mut wal))
         }
         None => f(&mut store, None),
     }
 }
 
-/// Rewrite the stream-definition manifest when persistence is on.
-fn save_manifest(persist_dir: &Option<String>, store: &Store) {
-    if let Some(dir) = persist_dir {
-        if let Err(err) = manifest::save(std::path::Path::new(dir), store) {
-            eprintln!("fakestream: manifest save failed: {err}");
+/// Create a stream and make its definition durable before acking. If the
+/// manifest save fails, roll the create back so a crash can't lose the
+/// definition (and the WAL records later written to it) after the client was
+/// told the stream exists.
+fn create_stream_durably(
+    store: &mut Store,
+    persist_dir: &Option<String>,
+    req: &Value,
+) -> Result<Value, ApiError> {
+    let result = ops::create_stream(store, req)?;
+    if let Err(err) = save_manifest(persist_dir, store) {
+        if let Some(name) = req.get("StreamName").and_then(Value::as_str) {
+            store.streams.remove(name);
         }
+        return Err(err);
     }
+    Ok(result)
 }
 
-fn write(store: &Arc<RwLock<Store>>) -> std::sync::RwLockWriteGuard<'_, Store> {
-    store.write().expect("store lock poisoned")
+/// Delete a stream and make the removal durable before acking. If the manifest
+/// save fails, restore the stream so a crash can't resurrect a stream the client
+/// was told had been deleted.
+fn delete_stream_durably(
+    store: &mut Store,
+    persist_dir: &Option<String>,
+    req: &Value,
+) -> Result<Value, ApiError> {
+    let removed = ops::delete_stream(store, req)?;
+    if let Err(err) = save_manifest(persist_dir, store) {
+        store.streams.insert(removed.name.clone(), removed);
+        return Err(err);
+    }
+    Ok(serde_json::json!({}))
 }
 
-fn read(store: &Arc<RwLock<Store>>) -> std::sync::RwLockReadGuard<'_, Store> {
-    store.read().expect("store lock poisoned")
+/// Rewrite the stream-definition manifest when persistence is on. A save failure
+/// is surfaced as `InternalFailure` so callers never ack a non-durable change.
+fn save_manifest(persist_dir: &Option<String>, store: &Store) -> Result<(), ApiError> {
+    let Some(dir) = persist_dir else {
+        return Ok(());
+    };
+    manifest::save(std::path::Path::new(dir), store).map_err(|err| {
+        tracing::error!(error = %err, "manifest save failed");
+        ApiError::internal("Stream definition could not be durably persisted")
+    })
 }
 
+fn write(store: &RwLock<Store>) -> RwLockWriteGuard<'_, Store> {
+    store.write().unwrap_or_else(|_| {
+        tracing::error!("store write lock poisoned; aborting");
+        std::process::abort();
+    })
+}
+
+fn read(store: &RwLock<Store>) -> RwLockReadGuard<'_, Store> {
+    store.read().unwrap_or_else(|_| {
+        tracing::error!("store read lock poisoned; aborting");
+        std::process::abort();
+    })
+}
+
+fn lock_wal(wal: &Mutex<Wal>) -> MutexGuard<'_, Wal> {
+    wal.lock().unwrap_or_else(|_| {
+        tracing::error!("WAL lock poisoned; aborting");
+        std::process::abort();
+    })
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "fixed Content-Type bytes are a valid HTTP header"
+)]
+fn metrics_header() -> Header {
+    Header::from_bytes(&b"Content-Type"[..], &b"text/plain; version=0.0.4"[..])
+        .expect("static header is valid")
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "fixed Content-Type bytes are a valid HTTP header"
+)]
 fn json_header() -> Header {
     Header::from_bytes(&b"Content-Type"[..], &b"application/x-amz-json-1.1"[..])
         .expect("static header is valid")
@@ -387,12 +510,163 @@ fn respond_ok_body(request: Request, body: Vec<u8>) {
     let _ = request.respond(response);
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "ApiError kinds are fixed AWS exception names valid in an HTTP header"
+)]
 fn respond_error(request: Request, err: &ApiError) {
     let error_type = Header::from_bytes(&b"x-amzn-errortype"[..], err.kind.as_bytes())
         .expect("error kind is valid header value");
     let response = Response::from_string(err.body())
-        .with_status_code(400)
+        .with_status_code(err.status)
         .with_header(json_header())
         .with_header(error_type);
     let _ = request.respond(response);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Record;
+    use serde_json::json;
+    use std::fs;
+
+    #[test]
+    fn body_size_check_accepts_cap_and_rejects_overflow() {
+        assert!(check_body_size(MAX_REQUEST_BODY_BYTES).is_ok());
+        assert_eq!(
+            check_body_size(MAX_REQUEST_BODY_BYTES + 1)
+                .unwrap_err()
+                .kind,
+            "ValidationException"
+        );
+    }
+
+    #[test]
+    fn failed_manifest_save_skips_wal_gc() {
+        let dir =
+            std::env::temp_dir().join(format!("fakestream-test-gc-skip-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // The store's only stream has been deleted, but the WAL still holds the
+        // deleted incarnation's records in a closed segment. If a crash restores
+        // a stale manifest that lists the stream, those records must still exist.
+        let store = RwLock::new(Store::new(86_400));
+        {
+            let mut s = store.write().unwrap();
+            s.create_stream("S", 1, None);
+            s.streams.remove("S");
+        }
+        let (mut wal, _) = Wal::load(&dir, 16).unwrap(); // tiny cap: each append rolls
+        let record = |seq: u64| Record {
+            seq,
+            partition_key: "p".into(),
+            data: vec![0u8; 20],
+            timestamp_ms: 1_000,
+        };
+        wal.append("S", "shardId-000000000000", &record(1)).unwrap();
+        wal.append("S", "shardId-000000000000", &record(2)).unwrap(); // rolls: seg 1 closes
+        let wal = Mutex::new(wal);
+        let wal_files = || fs::read_dir(dir.join("wal")).unwrap().count();
+        assert_eq!(wal_files(), 2, "one closed + one active segment");
+
+        // Block the manifest save: its temp-file path is occupied by a directory.
+        fs::create_dir(dir.join("manifest.json.tmp")).unwrap();
+        persist_and_gc(&store, &wal, &dir, 10_000_000);
+        assert!(!dir.join("manifest.json").exists());
+        assert_eq!(
+            wal_files(),
+            2,
+            "GC must not run when the manifest save fails"
+        );
+
+        // Unblocked, the next pass saves the manifest and only then drops the
+        // deleted stream's closed segment.
+        fs::remove_dir(dir.join("manifest.json.tmp")).unwrap();
+        persist_and_gc(&store, &wal, &dir, 10_000_000);
+        assert!(dir.join("manifest.json").exists());
+        assert_eq!(wal_files(), 1, "only the active segment remains");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_rolls_back_when_manifest_save_fails() {
+        let dir = std::env::temp_dir().join(format!(
+            "fakestream-test-create-rollback-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // Occupy the temp path with a directory so the manifest save fails.
+        fs::create_dir(dir.join("manifest.json.tmp")).unwrap();
+
+        let mut store = Store::new(86_400);
+        let persist = Some(dir.to_string_lossy().into_owned());
+        let err =
+            create_stream_durably(&mut store, &persist, &json!({ "StreamName": "S" })).unwrap_err();
+
+        assert_eq!(err.kind, "InternalFailure");
+        assert_eq!(err.status, 500);
+        assert!(
+            !store.streams.contains_key("S"),
+            "a create whose manifest didn't persist must not stay in memory"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_rolls_back_when_manifest_save_fails() {
+        let dir = std::env::temp_dir().join(format!(
+            "fakestream-test-delete-rollback-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut store = Store::new(86_400);
+        store.create_stream("S", 1, None);
+        store.put("S", "p".into(), vec![1, 2, 3], None);
+        let persist = Some(dir.to_string_lossy().into_owned());
+        // Block the save only for the delete.
+        fs::create_dir(dir.join("manifest.json.tmp")).unwrap();
+        let err =
+            delete_stream_durably(&mut store, &persist, &json!({ "StreamName": "S" })).unwrap_err();
+
+        assert_eq!(err.kind, "InternalFailure");
+        assert!(
+            store.streams.contains_key("S"),
+            "a delete whose manifest didn't persist must leave the stream in place"
+        );
+        assert_eq!(
+            store.last_record("S", "shardId-000000000000").unwrap().seq,
+            1,
+            "the restored stream must keep its records"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn successful_put_metrics_excludes_failed_entries() {
+        let request = [json!({ "Data": "AAAA" }), json!({ "Data": "AAAA" })];
+        let response = [
+            json!({ "ShardId": "shardId-000000000000", "SequenceNumber": "1" }),
+            json!({ "ErrorCode": "InternalFailure", "ErrorMessage": "boom" }),
+        ];
+        let (records, bytes) = successful_put_metrics(&request, &response);
+        assert_eq!(records, 1);
+        assert_eq!(bytes, 3); // one "AAAA" decodes to 3 bytes
+    }
+
+    #[test]
+    fn successful_put_metrics_counts_all_when_none_failed() {
+        let request = [json!({ "Data": "AAAA" }), json!({ "Data": "AAA=" })];
+        let response = [
+            json!({ "ShardId": "shardId-000000000000", "SequenceNumber": "1" }),
+            json!({ "ShardId": "shardId-000000000000", "SequenceNumber": "2" }),
+        ];
+        let (records, bytes) = successful_put_metrics(&request, &response);
+        assert_eq!(records, 2);
+        assert_eq!(bytes, 5); // 3 + 2
+    }
 }
