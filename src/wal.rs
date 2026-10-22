@@ -363,7 +363,7 @@ mod tests {
         let dir = tmp_dir("reload");
         {
             let (mut wal, entries) = Wal::load(&dir, 1 << 20).unwrap();
-            assert!(entries.is_empty());
+            assert_eq!(entries, vec![]);
             wal.append("S", "shardId-000000000000", &rec(1, vec![1]))
                 .unwrap();
             wal.append("S", "shardId-000000000000", &rec(2, vec![2]))
